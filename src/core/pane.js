@@ -2,7 +2,7 @@
  * Core pane/layout management logic.
  * Controls multi-chart layouts (split panes) in TradingView.
  */
-import { evaluate, evaluateAsync, getClient } from '../connection.js';
+import { evaluate, evaluateAsync, getClient, waitForActiveSymbol } from '../connection.js';
 
 const CWC = 'window.TradingViewApi._chartWidgetCollection';
 
@@ -133,8 +133,16 @@ export async function focus({ index }) {
 /**
  * Set the symbol on a specific pane by index.
  * Works by focusing the pane, then using the active chart's setSymbol.
+ *
+ * Does NOT report success on a fixed timer. chart.setSymbol() is async and
+ * its symbol label / resident bar buffer do not update atomically — a fixed
+ * sleep can return success while the pane still holds the PREVIOUS symbol's
+ * bars. Instead this polls the active main series (via the same
+ * waitForActiveSymbol() helper used to guard quote/OHLCV reads) until it
+ * genuinely settles on the requested symbol with bars available, and FAILS
+ * CLOSED (throws, no success=true) if it never settles within the timeout.
  */
-export async function setSymbol({ index, symbol }) {
+export async function setSymbol({ index, symbol, timeoutMs } = {}) {
   const idx = Number(index);
   const escaped = symbol.replace(/'/g, "\\'");
 
@@ -146,12 +154,14 @@ export async function setSymbol({ index, symbol }) {
   await evaluateAsync(`
     (function() {
       var chart = window.TradingViewApi._activeChartWidgetWV.value();
-      return new Promise(function(resolve) {
-        chart.setSymbol('${escaped}', {});
-        setTimeout(resolve, 500);
-      });
+      chart.setSymbol('${escaped}', {});
+      return true;
     })()
   `);
 
-  return { success: true, index: idx, symbol };
+  // Fail closed: only report success once the active pane has genuinely
+  // rebound to the requested symbol with bars ready.
+  const settled = await waitForActiveSymbol(symbol, { timeoutMs });
+
+  return { success: true, index: idx, symbol: settled.symbol, requested_symbol: symbol };
 }

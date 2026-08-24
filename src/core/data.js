@@ -1,12 +1,11 @@
 /**
  * Core data access logic.
  */
-import { evaluate, evaluateAsync, KNOWN_PATHS } from '../connection.js';
+import { evaluate, evaluateAsync, KNOWN_PATHS, assertActiveSymbolMatches } from '../connection.js';
 
 const MAX_OHLCV_BARS = 500;
 const MAX_TRADES = 20;
 const CHART_API = KNOWN_PATHS.chartApi;
-const BARS_PATH = KNOWN_PATHS.mainSeriesBars;
 
 function buildGraphicsJS(collectionName, mapKey, filter) {
   return `
@@ -59,13 +58,16 @@ function buildGraphicsJS(collectionName, mapKey, filter) {
   `;
 }
 
-export async function getOhlcv({ count, summary } = {}) {
+export async function getOhlcv({ symbol, count, summary } = {}) {
   const limit = Math.min(count || 100, MAX_OHLCV_BARS);
   let data;
   try {
     data = await evaluate(`
       (function() {
-        var bars = ${BARS_PATH};
+        var series = ${KNOWN_PATHS.mainSeries};
+        var activeSymbol = null;
+        try { activeSymbol = series.symbol(); } catch(e) {}
+        var bars = series.bars();
         if (!bars || typeof bars.lastIndex !== 'function') return null;
         var result = [];
         var end = bars.lastIndex();
@@ -74,7 +76,7 @@ export async function getOhlcv({ count, summary } = {}) {
           var v = bars.valueAt(i);
           if (v) result.push({time: v[0], open: v[1], high: v[2], low: v[3], close: v[4], volume: v[5] || 0});
         }
-        return {bars: result, total_bars: bars.size(), source: 'direct_bars'};
+        return {bars: result, total_bars: bars.size(), source: 'direct_bars', active_symbol: activeSymbol};
       })()
     `);
   } catch { data = null; }
@@ -82,6 +84,18 @@ export async function getOhlcv({ count, summary } = {}) {
   if (!data || !data.bars || data.bars.length === 0) {
     throw new Error('Could not extract OHLCV data. The chart may still be loading.');
   }
+
+  // Identity guard: the bars above were read from whatever the active chart
+  // widget's main series ACTUALLY holds, captured in the SAME evaluate() call
+  // as `active_symbol` (atomic — no second round trip to reopen the race). If
+  // the caller asked for a specific `symbol`, it must reconcile with what was
+  // really bound at read time; a stale/cross-symbol buffer FAILS CLOSED rather
+  // than returning mismatched bars under the requested ticker's name.
+  assertActiveSymbolMatches(symbol, {
+    symbol: data.active_symbol,
+    barCount: data.bars.length,
+    ready: true,
+  });
 
   if (summary) {
     const bars = data.bars;
@@ -91,7 +105,7 @@ export async function getOhlcv({ count, summary } = {}) {
     const first = bars[0];
     const last = bars[bars.length - 1];
     return {
-      success: true, bar_count: bars.length,
+      success: true, symbol: data.active_symbol, bar_count: bars.length,
       period: { from: first.time, to: last.time },
       open: first.open, close: last.close,
       high: Math.max(...highs), low: Math.min(...lows),
@@ -103,7 +117,7 @@ export async function getOhlcv({ count, summary } = {}) {
     };
   }
 
-  return { success: true, bar_count: data.bars.length, total_available: data.total_bars, source: data.source, bars: data.bars };
+  return { success: true, symbol: data.active_symbol, bar_count: data.bars.length, total_available: data.total_bars, source: data.source, bars: data.bars };
 }
 
 export async function getIndicator({ entity_id }) {
@@ -246,17 +260,24 @@ export async function getQuote({ symbol } = {}) {
   const data = await evaluate(`
     (function() {
       var api = ${CHART_API};
-      var sym = '${symbol || ''}';
-      if (!sym) { try { sym = api.symbol(); } catch(e) {} }
-      if (!sym) { try { sym = api.symbolExt().symbol; } catch(e) {} }
+      var series = ${KNOWN_PATHS.mainSeries};
+      // ACTUAL bound symbol read from the series itself, not the caller's
+      // requested string — the requested symbol is verified separately
+      // below and must never silently relabel someone else's data.
+      var activeSymbol = null;
+      try { activeSymbol = series.symbol(); } catch(e) {}
+      if (!activeSymbol) { try { activeSymbol = api.symbol(); } catch(e) {} }
+      if (!activeSymbol) { try { activeSymbol = api.symbolExt().symbol; } catch(e) {} }
       var ext = {};
       try { ext = api.symbolExt() || {}; } catch(e) {}
-      var bars = ${BARS_PATH};
-      var quote = { symbol: sym };
-      if (bars && typeof bars.lastIndex === 'function') {
-        var last = bars.valueAt(bars.lastIndex());
-        if (last) { quote.time = last[0]; quote.open = last[1]; quote.high = last[2]; quote.low = last[3]; quote.close = last[4]; quote.last = last[4]; quote.volume = last[5] || 0; }
-      }
+      var quote = { symbol: activeSymbol };
+      try {
+        var bars = series.bars();
+        if (bars && typeof bars.lastIndex === 'function') {
+          var last = bars.valueAt(bars.lastIndex());
+          if (last) { quote.time = last[0]; quote.open = last[1]; quote.high = last[2]; quote.low = last[3]; quote.close = last[4]; quote.last = last[4]; quote.volume = last[5] || 0; }
+        }
+      } catch(e) {}
       try {
         var bidEl = document.querySelector('[class*="bid"] [class*="price"], [class*="dom-"] [class*="bid"]');
         var askEl = document.querySelector('[class*="ask"] [class*="price"], [class*="dom-"] [class*="ask"]');
@@ -274,6 +295,13 @@ export async function getQuote({ symbol } = {}) {
     })()
   `);
   if (!data || (!data.last && !data.close)) throw new Error('Could not retrieve quote. The chart may still be loading.');
+
+  // Identity guard: `data.symbol` is the ACTUAL bound symbol read in the same
+  // evaluate() call as the price fields above (atomic). If the caller asked
+  // for a specific `symbol`, it must reconcile with what was really bound at
+  // read time — never echo the requested string over mismatched data.
+  assertActiveSymbolMatches(symbol, { symbol: data.symbol, barCount: 1, ready: true });
+
   return { success: true, ...data };
 }
 

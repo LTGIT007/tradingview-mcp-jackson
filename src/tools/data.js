@@ -4,10 +4,11 @@ import * as core from '../core/data.js';
 
 export function registerDataTools(server) {
   server.tool('data_get_ohlcv', 'Get OHLCV bar data from the chart. Use summary=true for compact stats instead of all bars (saves context).', {
+    symbol: z.string().optional().describe('Symbol the bars must actually belong to (blank = trust whatever the active chart shows). If supplied and it does not match the active chart\'s real bound symbol, the call fails closed instead of returning mismatched data.'),
     count: z.coerce.number().optional().describe('Number of bars to retrieve (max 500, default 100)'),
     summary: z.coerce.boolean().optional().describe('Return summary stats (high, low, open, close, avg volume, range) instead of all bars — much smaller output'),
-  }, async ({ count, summary }) => {
-    try { return jsonResult(await core.getOhlcv({ count, summary })); }
+  }, async ({ symbol, count, summary }) => {
+    try { return jsonResult(await core.getOhlcv({ symbol, count, summary })); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
