@@ -26,6 +26,16 @@ import { fileURLToPath } from 'url';
 import { getOhlcv } from './data.js';
 import { setSymbol as paneSetSymbol } from './pane.js';
 import { setTimeframe } from './chart.js';
+import { normalizeSymbol } from '../connection.js';
+
+// Bounded post-switch data-readiness gate defaults. After a symbol switch the
+// resident bar buffer can briefly still hold the PREVIOUS symbol's data even
+// though the symbol label has already flipped (see readFreshBars). We poll the
+// proven getOhlcv path a bounded number of times, exiting the INSTANT the data
+// diverges — this is NOT a fixed sleep and never blocks the full window on a
+// healthy switch.
+const DEFAULT_READINESS_POLLS = 8;
+const DEFAULT_READINESS_INTERVAL_MS = 150;
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // src/core/dump.js → repo root is two directories up from src/core.
@@ -58,20 +68,100 @@ export function resolveDumpPath(filename) {
 }
 
 /**
- * Acquire one symbol: switch the active chart to it (with fail-closed
- * readiness) then read its bars via the shared getOhlcv primitive. Throws on
- * any failure so the caller can apply its retry / soft-fail policy.
+ * Deterministic SHA-256 fingerprint over a series' native OHLCV fields, in the
+ * order the bars are given (they are time-ordered). This is used ONLY to detect
+ * stale-series contamination: two DIFFERENT requested symbols must never yield a
+ * byte-identical series. It is not a data checksum for storage — just a compact,
+ * order-sensitive identity for the read buffer.
  */
-async function acquireSymbol({ symbol, count, timeoutMs }) {
-  await paneSetSymbol({ index: 0, symbol, timeoutMs });
-  const r = await getOhlcv({ symbol, count });
-  if (!r || !Array.isArray(r.bars) || r.bars.length === 0) {
-    throw new Error(`No bars returned for ${symbol}`);
+export function fingerprintBars(bars) {
+  const h = createHash('sha256');
+  for (const b of bars) {
+    h.update(`${b.time}|${b.open}|${b.high}|${b.low}|${b.close}|${b.volume}\n`);
   }
-  return r.bars;
+  return h.digest('hex');
 }
 
-export async function dumpOhlcv({ symbols, timeframe = 'D', count = 350, filename, timeoutMs } = {}) {
+/**
+ * Read the active pane's series via the shared getOhlcv primitive and PROVE the
+ * returned bars belong to the new binding — not the previous symbol's resident
+ * buffer.
+ *
+ * The symbol-identity guards in pane.setSymbol()/getOhlcv() are necessary but
+ * NOT sufficient: TradingView flips mainSeries().symbol() to the new ticker
+ * BEFORE it swaps the resident bar buffer, so a read landing in that window sees
+ * the NEW label over the PREVIOUS symbol's bars — the exact live ANN←CLX
+ * corruption. This adds a bounded POSITIVE data-readiness gate: when the
+ * requested symbol differs from the previous SUCCESSFUL symbol yet the returned
+ * series is byte-identical to it (fingerprint match), the buffer has not yet
+ * refreshed. We then poll the SAME getOhlcv path until the series demonstrably
+ * diverges (data now belongs to the new binding) and return that, or FAIL CLOSED
+ * with an explicit STALE_SERIES_AFTER_SYMBOL_SWITCH error if it never diverges.
+ * Bounded (no infinite retries) and exits early the instant data changes (not a
+ * fixed multi-second sleep).
+ *
+ * Returns { bars, fingerprint }. Throws on empty data or persistent staleness.
+ */
+async function readFreshBars({ symbol, count, prevSymbol, prevFingerprint, maxPolls, intervalMs }) {
+  const read = async () => {
+    const r = await getOhlcv({ symbol, count });
+    if (!r || !Array.isArray(r.bars) || r.bars.length === 0) {
+      throw new Error(`No bars returned for ${symbol}`);
+    }
+    return r.bars;
+  };
+
+  let bars = await read();
+  let fp = fingerprintBars(bars);
+
+  const crossSymbol =
+    prevSymbol != null && normalizeSymbol(symbol) !== normalizeSymbol(prevSymbol);
+
+  // Only a cross-symbol byte-identical series is suspicious. Identical data for
+  // the SAME requested instrument (e.g. re-read, or two feed prefixes of one
+  // ticker) is legitimate and never flagged.
+  if (crossSymbol && prevFingerprint != null && fp === prevFingerprint) {
+    for (let poll = 0; poll < maxPolls; poll++) {
+      await new Promise((r) => setTimeout(r, intervalMs));
+      const next = await read();
+      const nextFp = fingerprintBars(next);
+      if (nextFp !== prevFingerprint) {
+        return { bars: next, fingerprint: nextFp }; // diverged → new binding proven
+      }
+      bars = next;
+      fp = nextFp;
+    }
+    throw new Error(
+      `STALE_SERIES_AFTER_SYMBOL_SWITCH: ${symbol} returned a series byte-identical to the previous `
+        + `symbol ${JSON.stringify(prevSymbol)} through ${maxPolls} readiness polls — the resident bar `
+        + `buffer never refreshed to the new binding. Refusing to write ${JSON.stringify(prevSymbol)}'s `
+        + `bars under ${symbol}.`
+    );
+  }
+
+  return { bars, fingerprint: fp };
+}
+
+/**
+ * Acquire one symbol: switch the active chart to it (with fail-closed
+ * readiness) then read its bars via the shared getOhlcv primitive, proving the
+ * bars belong to the new binding (readFreshBars). Throws on any failure so the
+ * caller can apply its retry / soft-fail policy.
+ */
+async function acquireSymbol({ symbol, count, timeoutMs, prevSymbol, prevFingerprint, maxPolls, intervalMs }) {
+  await paneSetSymbol({ index: 0, symbol, timeoutMs });
+  return readFreshBars({ symbol, count, prevSymbol, prevFingerprint, maxPolls, intervalMs });
+}
+
+export async function dumpOhlcv({
+  symbols,
+  timeframe = 'D',
+  count = 350,
+  filename,
+  timeoutMs,
+  readinessPolls = DEFAULT_READINESS_POLLS,
+  readinessIntervalMs = DEFAULT_READINESS_INTERVAL_MS,
+} = {}) {
   if (!Array.isArray(symbols) || symbols.length === 0) {
     throw new Error('symbols must be a non-empty array.');
   }
@@ -87,23 +177,38 @@ export async function dumpOhlcv({ symbols, timeframe = 'D', count = 350, filenam
   const failures = {};  // file: { symbol: "error message" }
   const perSymbol = {}; // response metadata for EVERY requested symbol
 
+  // Identity of the last SUCCESSFULLY acquired series — the reference the
+  // post-switch contamination guard compares each NEW symbol against. Updated
+  // only on success, so a failed symbol never poisons the reference.
+  let prevSymbol = null;
+  let prevFingerprint = null;
+
   // 2. Sequential acquisition. One symbol failing never aborts the rest.
   for (const symbol of symbols) {
-    let bars = null;
+    let acquired = null;
     let lastErr = null;
-    // One initial attempt + at most ONE retry.
+    // One initial attempt + at most ONE rebind retry.
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        bars = await acquireSymbol({ symbol, count, timeoutMs });
+        acquired = await acquireSymbol({
+          symbol,
+          count,
+          timeoutMs,
+          prevSymbol,
+          prevFingerprint,
+          maxPolls: readinessPolls,
+          intervalMs: readinessIntervalMs,
+        });
         lastErr = null;
         break;
       } catch (e) {
         lastErr = e;
-        bars = null;
+        acquired = null;
       }
     }
 
-    if (bars) {
+    if (acquired) {
+      const bars = acquired.bars;
       okSymbols[symbol] = { bars };
       const first = bars[0];
       const last = bars[bars.length - 1];
@@ -114,6 +219,8 @@ export async function dumpOhlcv({ symbols, timeframe = 'D', count = 350, filenam
         last_close: last.close,
         error: null,
       };
+      prevSymbol = symbol;
+      prevFingerprint = acquired.fingerprint;
     } else {
       const msg = lastErr ? lastErr.message : 'unknown error';
       failures[symbol] = msg;

@@ -24,11 +24,27 @@ const DUMP_SRC = join(__dirname, '..', 'src', 'core', 'dump.js');
 const calls = { setTimeframe: [], setSymbol: [], getOhlcv: [] };
 const attempts = {};        // symbol -> times getOhlcv has been invoked
 let plan = {};              // symbol -> 'ok' | 'fail' | 'fail-then-ok' | 'fail-pane'
+let staleReads = {};        // symbol -> { asSymbol, remaining }  (simulates stale buffer)
 
+// Bare-ticker normalization mirroring src/connection.js normalizeSymbol, so
+// that "ASX:RHC" and "ASX_DLY:RHC" resolve to the SAME instrument and therefore
+// the SAME bars (a real feed-prefix alias), while distinct tickers get distinct,
+// deterministic bars (distinct fingerprints).
+function ticker(symbol) {
+  const parts = String(symbol).split(':');
+  return parts[parts.length - 1].toUpperCase();
+}
+function seed(symbol) {
+  const t = ticker(symbol);
+  let s = 0;
+  for (let i = 0; i < t.length; i++) s = (s * 31 + t.charCodeAt(i)) % 100000;
+  return s;
+}
 function makeBars(symbol, n = 5) {
+  const base = 10 + (seed(symbol) % 90); // distinct base price per instrument
   return Array.from({ length: n }, (_, i) => ({
     time: 1788000000 + i * 86400,
-    open: 10 + i, high: 10.5 + i, low: 9.5 + i, close: 10.2 + i, volume: 1000 + i,
+    open: base + i, high: base + 0.5 + i, low: base - 0.5 + i, close: base + 0.2 + i, volume: 1000 + i,
   }));
 }
 
@@ -54,12 +70,21 @@ mock.module('../src/core/data.js', {
       const p = plan[symbol] || 'ok';
       if (p === 'fail') throw new Error(`boom ${symbol}`);
       if (p === 'fail-then-ok' && attempts[symbol] === 1) throw new Error(`transient ${symbol}`);
+      // Simulate the live race: the symbol label has flipped to `symbol` but the
+      // resident bar buffer still holds `asSymbol`'s (previous) bars for the
+      // first `remaining` reads. getOhlcv's own label guard passes (label==symbol)
+      // yet the BARS are stale — exactly the ANN←CLX corruption.
+      const stale = staleReads[symbol];
+      if (stale && stale.remaining > 0) {
+        stale.remaining -= 1;
+        return { success: true, symbol, bar_count: 5, bars: makeBars(stale.asSymbol) };
+      }
       return { success: true, symbol, bar_count: 5, bars: makeBars(symbol) };
     },
   },
 });
 
-const { dumpOhlcv, resolveDumpPath, DUMP_DIR } = await import('../src/core/dump.js');
+const { dumpOhlcv, resolveDumpPath, DUMP_DIR, fingerprintBars } = await import('../src/core/dump.js');
 
 const created = new Set();
 async function runDump(opts) {
@@ -74,6 +99,7 @@ beforeEach(() => {
   calls.getOhlcv.length = 0;
   for (const k of Object.keys(attempts)) delete attempts[k];
   plan = {};
+  staleReads = {};
 });
 
 after(() => {
@@ -255,5 +281,148 @@ describe('dumpOhlcv — reuses existing primitives (no duplicated OHLCV impl)', 
     }
     assert.match(code, /from '\.\/data\.js'/);
     assert.match(code, /getOhlcv/);
+  });
+});
+
+// ── Symbol-data binding race regression (reproduces the live ANN←CLX bug) ────
+//
+// LIVE FAILURE (2026-09-08): requested RHC, CLX, ANN sequentially; ANN came back
+// byte-identical to CLX because TradingView flipped the symbol LABEL to ANN
+// before swapping the resident bar buffer, so the first ANN read returned CLX's
+// bars under the ANN label. The symbol-identity guards alone accepted it. The
+// post-switch data-readiness gate + fail-closed contamination guard must catch
+// this. `readinessIntervalMs: 0` keeps these deterministic and fast.
+describe('dumpOhlcv — symbol-data binding race (readiness + contamination guard)', () => {
+  it('(A) stale first read → readiness poll re-reads → correct symbol succeeds', async () => {
+    // ANN's first read is contaminated with CLX's bars; the next read is the
+    // genuine ANN series.
+    staleReads = { 'ASX:ANN': { asSymbol: 'ASX:CLX', remaining: 1 } };
+    const res = await runDump({
+      symbols: ['ASX:CLX', 'ASX:ANN'],
+      filename: 'd_race_recover',
+      readinessPolls: 4,
+      readinessIntervalMs: 0,
+    });
+
+    assert.equal(res.symbols_succeeded, 2);
+    assert.equal(res.symbols_failed, 0);
+
+    const file = JSON.parse(readFileSync(res.path, 'utf8'));
+    const annFp = fingerprintBars(file.symbols['ASX:ANN'].bars);
+    const clxFp = fingerprintBars(file.symbols['ASX:CLX'].bars);
+    // ANN must hold the REAL ANN series, never CLX's.
+    assert.notEqual(annFp, clxFp, 'ANN must not be written as CLX');
+    assert.equal(annFp, fingerprintBars(makeBars('ASX:ANN')));
+
+    // Exactly one extra read happened for ANN (initial stale + one poll), and
+    // NO rebind was needed (one setSymbol).
+    assert.equal(calls.getOhlcv.filter((c) => c.symbol === 'ASX:ANN').length, 2);
+    assert.equal(calls.setSymbol.filter((s) => s === 'ASX:ANN').length, 1);
+  });
+
+  it('(B) stale first read + stale retry → ANN fails CLOSED (never written)', async () => {
+    staleReads = { 'ASX:ANN': { asSymbol: 'ASX:CLX', remaining: Infinity } };
+    const res = await runDump({
+      symbols: ['ASX:CLX', 'ASX:ANN'],
+      filename: 'd_race_failclosed',
+      readinessPolls: 2,
+      readinessIntervalMs: 0,
+    });
+
+    assert.equal(res.symbols_succeeded, 1); // only CLX
+    assert.equal(res.symbols_failed, 1);
+    assert.match(res.per_symbol['ASX:ANN'].error, /STALE_SERIES_AFTER_SYMBOL_SWITCH/);
+    assert.equal(res.per_symbol['ASX:ANN'].bars, 0);
+
+    const file = JSON.parse(readFileSync(res.path, 'utf8'));
+    assert.equal(file.symbols['ASX:ANN'], undefined, 'contaminated ANN must not be written');
+    assert.ok(file.failures['ASX:ANN']);
+  });
+
+  it('(C) a failed contaminated symbol does not abort a following valid symbol', async () => {
+    staleReads = { 'ASX:ANN': { asSymbol: 'ASX:CLX', remaining: Infinity } };
+    const res = await runDump({
+      symbols: ['ASX:CLX', 'ASX:ANN', 'ASX:WBC'],
+      filename: 'd_race_continue',
+      readinessPolls: 2,
+      readinessIntervalMs: 0,
+    });
+
+    assert.equal(res.per_symbol['ASX:ANN'].error !== null, true);
+    assert.equal(res.per_symbol['ASX:WBC'].error, null);
+    assert.equal(res.symbols_succeeded, 2); // CLX + WBC
+    const file = JSON.parse(readFileSync(res.path, 'utf8'));
+    assert.deepEqual(Object.keys(file.symbols).sort(), ['ASX:CLX', 'ASX:WBC']);
+  });
+
+  it('(D) identical fingerprint for the SAME instrument (feed-prefix alias) is allowed', async () => {
+    // ASX:RHC and ASX_DLY:RHC are the same instrument → identical bars → identical
+    // fingerprint, but they must NOT trip the cross-symbol guard.
+    assert.equal(
+      fingerprintBars(makeBars('ASX:RHC')),
+      fingerprintBars(makeBars('ASX_DLY:RHC')),
+      'sanity: aliases must produce identical bars',
+    );
+    const res = await runDump({
+      symbols: ['ASX:RHC', 'ASX_DLY:RHC'],
+      filename: 'd_race_alias',
+      readinessPolls: 2,
+      readinessIntervalMs: 0,
+    });
+    assert.equal(res.symbols_succeeded, 2);
+    assert.equal(res.symbols_failed, 0);
+  });
+
+  it('(E) identical fingerprint across DIFFERENT symbols triggers the guard (never relabeled)', async () => {
+    staleReads = { 'ASX:ANN': { asSymbol: 'ASX:CLX', remaining: Infinity } };
+    const res = await runDump({
+      symbols: ['ASX:CLX', 'ASX:ANN'],
+      filename: 'd_race_guard',
+      readinessPolls: 2,
+      readinessIntervalMs: 0,
+    });
+    // The guard fires precisely because ANN's series == CLX's series.
+    assert.match(res.per_symbol['ASX:ANN'].error, /byte-identical|STALE_SERIES_AFTER_SYMBOL_SWITCH/);
+    assert.match(res.per_symbol['ASX:ANN'].error, /CLX/);
+    const file = JSON.parse(readFileSync(res.path, 'utf8'));
+    // CLX's bars are never written under ANN.
+    assert.equal(file.symbols['ASX:ANN'], undefined);
+  });
+
+  it('(F) no raw bars enter the tool response even on the readiness/poll path', async () => {
+    staleReads = { 'ASX:ANN': { asSymbol: 'ASX:CLX', remaining: 1 } };
+    const res = await runDump({
+      symbols: ['ASX:CLX', 'ASX:ANN'],
+      filename: 'd_race_noraw',
+      readinessPolls: 4,
+      readinessIntervalMs: 0,
+    });
+    const serialized = JSON.stringify(res);
+    assert.ok(!serialized.includes('"open"'), 'response must not contain OHLC bar objects');
+    assert.ok(!serialized.includes('"volume"'));
+    assert.equal(typeof res.per_symbol['ASX:ANN'].bars, 'number');
+  });
+
+  it('(G) existing single-symbol behaviour is unchanged (no gate, no extra reads)', async () => {
+    const res = await runDump({ symbols: ['ASX:RHC'], filename: 'd_race_single' });
+    assert.equal(res.symbols_succeeded, 1);
+    // Exactly one read, one switch — the contamination gate never engages with
+    // no previous symbol.
+    assert.equal(calls.getOhlcv.filter((c) => c.symbol === 'ASX:RHC').length, 1);
+    assert.equal(calls.setSymbol.filter((s) => s === 'ASX:RHC').length, 1);
+  });
+
+  it('(H) retry stays bounded to one rebind after persistent contamination', async () => {
+    staleReads = { 'ASX:ANN': { asSymbol: 'ASX:CLX', remaining: Infinity } };
+    await runDump({
+      symbols: ['ASX:CLX', 'ASX:ANN'],
+      filename: 'd_race_bounded',
+      readinessPolls: 2,
+      readinessIntervalMs: 0,
+    });
+    // ONE initial switch + exactly ONE rebind retry = 2 setSymbol calls for ANN.
+    assert.equal(calls.setSymbol.filter((s) => s === 'ASX:ANN').length, 2);
+    // Each attempt: 1 initial read + 2 bounded readiness polls = 3; two attempts = 6.
+    assert.equal(calls.getOhlcv.filter((c) => c.symbol === 'ASX:ANN').length, 6);
   });
 });
