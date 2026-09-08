@@ -1,5 +1,6 @@
 node_modules/
 screenshots/
+dumps/
 scripts/current.pine
 temp_*
 *.log
