@@ -235,8 +235,37 @@ export async function dumpOhlcv({
   // COMPLETED-history (bindingFingerprint) value, never the full series, so an
   // evolving forming bar cannot mask stale data. Updated only on success, so a
   // failed symbol never poisons the reference.
+  //
+  // SEED IT WITH THE PRE-CALL ACTIVE BINDING so the FIRST requested symbol is
+  // guarded exactly like every in-call transition. Every symbol switch needs a
+  // previous binding reference — including symbols[0]. When this call begins the
+  // chart is already parked on some instrument; that resident series IS the implicit
+  // "previous successful" binding for the first requested symbol. Without this seed
+  // symbols[0] is unguarded and can silently inherit the pre-existing buffer (the
+  // live 2026-09-09 A1M→RHC contamination: the chart was on A1M, the call opened
+  // with RHC, and RHC was written with A1M's completed history). We read the active
+  // series through the SAME getOhlcv primitive — no `symbol` arg means "whatever is
+  // active", which never relabels data — AFTER setTimeframe, so the baseline is on
+  // the same resolution as the per-symbol reads, then fingerprint its COMPLETED
+  // history (final/forming bar excluded, same as every other binding fp).
+  //
+  // If the chart has no usable series/bars (blank/still loading), we leave the seed
+  // null and fall back to an unguarded first-symbol acquisition rather than
+  // fabricating a fresh-binding assumption — the in-call guard still protects
+  // symbols[1..N].
   let prevSymbol = null;
   let prevFingerprint = null;
+  try {
+    const preCall = await getOhlcv({ count });
+    if (preCall && Array.isArray(preCall.bars) && preCall.bars.length > 0 && preCall.symbol) {
+      prevSymbol = preCall.symbol;
+      prevFingerprint = bindingFingerprint(preCall.bars);
+    }
+  } catch {
+    // No usable active series — safe fall-back to an unseeded first symbol.
+    prevSymbol = null;
+    prevFingerprint = null;
+  }
 
   // 2. Sequential acquisition. One symbol failing never aborts the rest.
   for (const symbol of symbols) {

@@ -25,6 +25,7 @@ const calls = { setTimeframe: [], setSymbol: [], getOhlcv: [] };
 const attempts = {};        // symbol -> times getOhlcv has been invoked
 let plan = {};              // symbol -> 'ok' | 'fail' | 'fail-then-ok' | 'fail-pane'
 let staleReads = {};        // symbol -> { asSymbol, remaining }  (simulates stale buffer)
+let activeChart = null;     // symbol the chart is PARKED on before the call (pre-call binding)
 
 // Bare-ticker normalization mirroring src/connection.js normalizeSymbol, so
 // that "ASX:RHC" and "ASX_DLY:RHC" resolve to the SAME instrument and therefore
@@ -66,6 +67,15 @@ mock.module('../src/core/data.js', {
   exports: {
     getOhlcv: async ({ symbol, count }) => {
       calls.getOhlcv.push({ symbol, count });
+      // No `symbol` → "read whatever the chart is currently parked on". This is the
+      // pre-call active-binding capture: it returns the resident active series
+      // (activeChart). A blank/still-loading chart (activeChart == null) throws
+      // exactly like the real getOhlcv, so the tool falls back to an unseeded first
+      // symbol — never a fabricated fresh binding.
+      if (symbol == null) {
+        if (activeChart == null) throw new Error('Could not extract OHLCV data. The chart may still be loading.');
+        return { success: true, symbol: activeChart, bar_count: 5, bars: makeBars(activeChart) };
+      }
       attempts[symbol] = (attempts[symbol] || 0) + 1;
       const p = plan[symbol] || 'ok';
       if (p === 'fail') throw new Error(`boom ${symbol}`);
@@ -112,6 +122,7 @@ beforeEach(() => {
   for (const k of Object.keys(attempts)) delete attempts[k];
   plan = {};
   staleReads = {};
+  activeChart = null;
 });
 
 after(() => {
@@ -553,5 +564,150 @@ describe('dumpOhlcv — forming-bar evolution (DPM→A1M contamination regressio
     assert.equal(res.symbols_succeeded, 2); // DPM + WAF
     const file = JSON.parse(readFileSync(res.path, 'utf8'));
     assert.deepEqual(Object.keys(file.symbols).sort(), ['ASX:DPM', 'ASX:WAF']);
+  });
+});
+
+// ── First-symbol-of-call binding regression (reproduces the live A1M→RHC bug) ──
+//
+// LIVE FAILURE (2026-09-09, ASX open): the chart was already parked on ASX_DLY:A1M
+// when a fresh data_dump_ohlcv call opened with ASX:RHC. RHC was silently written
+// with A1M's full bar history (comp_fp identical, RHC ~$0.83 vs its true ~$50). The
+// in-call guard correctly protected a later DPM→A1M transition — but symbols[0] had
+// NO previous binding reference, so it inherited the pre-existing chart buffer. The
+// fix seeds the contamination guard with the PRE-CALL active binding so the first
+// requested symbol is guarded exactly like symbol N→N+1. `readinessIntervalMs: 0`
+// keeps these deterministic and fast.
+describe('dumpOhlcv — first symbol vs pre-call active binding (A1M→RHC regression)', () => {
+  it('(A/C/D) first symbol returns the pre-call active history → detected & FAILS CLOSED (never written)', async () => {
+    activeChart = 'ASX_DLY:A1M';
+    // RHC's every read is contaminated with the pre-call A1M buffer.
+    staleReads = { 'ASX:RHC': { asSymbol: 'ASX_DLY:A1M', remaining: Infinity } };
+    const res = await runDump({
+      symbols: ['ASX:RHC'],
+      filename: 'd_first_failclosed',
+      readinessPolls: 2,
+      readinessIntervalMs: 0,
+    });
+    assert.equal(res.symbols_succeeded, 0);
+    assert.equal(res.symbols_failed, 1);
+    // Detected from the PRE-CALL baseline and named against the active symbol.
+    assert.match(res.per_symbol['ASX:RHC'].error, /STALE_SERIES_AFTER_SYMBOL_SWITCH/);
+    assert.match(res.per_symbol['ASX:RHC'].error, /A1M/);
+    assert.equal(res.per_symbol['ASX:RHC'].bars, 0);
+    const file = JSON.parse(readFileSync(res.path, 'utf8'));
+    assert.equal(file.symbols['ASX:RHC'], undefined, "A1M's bars must never be written under RHC");
+    assert.ok(file.failures['ASX:RHC']);
+    // Bounded: one initial switch + exactly one rebind retry.
+    assert.equal(calls.setSymbol.filter((s) => s === 'ASX:RHC').length, 2);
+  });
+
+  it('(B) once the genuine RHC completed history appears, the first symbol succeeds', async () => {
+    activeChart = 'ASX_DLY:A1M';
+    // One stale read (pre-call A1M) then the real RHC series.
+    staleReads = { 'ASX:RHC': { asSymbol: 'ASX_DLY:A1M', remaining: 1 } };
+    const res = await runDump({
+      symbols: ['ASX:RHC'],
+      filename: 'd_first_recover',
+      readinessPolls: 4,
+      readinessIntervalMs: 0,
+    });
+    assert.equal(res.symbols_succeeded, 1);
+    assert.equal(res.symbols_failed, 0);
+    const file = JSON.parse(readFileSync(res.path, 'utf8'));
+    assert.equal(fingerprintBars(file.symbols['ASX:RHC'].bars), fingerprintBars(makeBars('ASX:RHC')));
+    // Recovered via the readiness poll — no rebind needed (single setSymbol).
+    assert.equal(calls.getOhlcv.filter((c) => c.symbol === 'ASX:RHC').length, 2);
+    assert.equal(calls.setSymbol.filter((s) => s === 'ASX:RHC').length, 1);
+  });
+
+  it('(E) a failed first symbol does not abort a following valid symbol', async () => {
+    activeChart = 'ASX_DLY:A1M';
+    staleReads = { 'ASX:RHC': { asSymbol: 'ASX_DLY:A1M', remaining: Infinity } };
+    const res = await runDump({
+      symbols: ['ASX:RHC', 'ASX:L1G'],
+      filename: 'd_first_continue',
+      readinessPolls: 2,
+      readinessIntervalMs: 0,
+    });
+    assert.equal(res.per_symbol['ASX:RHC'].error !== null, true);
+    assert.equal(res.per_symbol['ASX:L1G'].error, null);
+    assert.equal(res.symbols_succeeded, 1); // L1G only
+    const file = JSON.parse(readFileSync(res.path, 'utf8'));
+    assert.deepEqual(Object.keys(file.symbols).sort(), ['ASX:L1G']);
+  });
+
+  it('(F) first requested symbol == the SAME normalized active instrument is allowed', async () => {
+    // Chart parked on ASX_DLY:A1M; call opens with ASX:A1M (same instrument). Its
+    // history legitimately equals the pre-call baseline → must NOT trip the guard.
+    activeChart = 'ASX_DLY:A1M';
+    const res = await runDump({
+      symbols: ['ASX:A1M'],
+      filename: 'd_first_alias',
+      readinessPolls: 2,
+      readinessIntervalMs: 0,
+    });
+    assert.equal(res.symbols_succeeded, 1);
+    assert.equal(res.symbols_failed, 0);
+    // Same instrument → cross-symbol guard never engages → single read, no poll.
+    assert.equal(calls.getOhlcv.filter((c) => c.symbol === 'ASX:A1M').length, 1);
+  });
+
+  it('(G) an evolving forming bar cannot defeat the pre-call completed-history comparison', async () => {
+    activeChart = 'ASX_DLY:A1M';
+    // Every RHC read returns A1M's completed history with a DIFFERENT forming-bar
+    // volume, so a full-series fingerprint would differ each read — the completed
+    // history still matches the pre-call baseline and must keep failing closed.
+    staleReads = { 'ASX:RHC': { asSymbol: 'ASX_DLY:A1M', remaining: Infinity, evolveFinalBar: true } };
+    const res = await runDump({
+      symbols: ['ASX:RHC'],
+      filename: 'd_first_forming',
+      readinessPolls: 2,
+      readinessIntervalMs: 0,
+    });
+    assert.equal(res.symbols_succeeded, 0);
+    assert.match(res.per_symbol['ASX:RHC'].error, /STALE_SERIES_AFTER_SYMBOL_SWITCH/);
+    const file = JSON.parse(readFileSync(res.path, 'utf8'));
+    assert.equal(file.symbols['ASX:RHC'], undefined);
+  });
+
+  it('(H) first-symbol guard AND in-call DPM→A1M guard both fire in one call', async () => {
+    // Pre-call chart on A1M. RHC (first) inherits A1M → fails. DPM is genuine and
+    // succeeds. A1M (last) inherits DPM in-call → fails. This proves the new
+    // first-symbol seed and the existing in-call completed-history guard coexist.
+    activeChart = 'ASX_DLY:A1M';
+    staleReads = {
+      'ASX:RHC': { asSymbol: 'ASX_DLY:A1M', remaining: Infinity, evolveFinalBar: true },
+      'ASX:A1M': { asSymbol: 'ASX:DPM', remaining: Infinity, evolveFinalBar: true },
+    };
+    const res = await runDump({
+      symbols: ['ASX:RHC', 'ASX:DPM', 'ASX:A1M'],
+      filename: 'd_first_and_incall',
+      readinessPolls: 2,
+      readinessIntervalMs: 0,
+    });
+    assert.equal(res.symbols_succeeded, 1); // DPM only
+    assert.equal(res.symbols_failed, 2);
+    assert.match(res.per_symbol['ASX:RHC'].error, /STALE_SERIES_AFTER_SYMBOL_SWITCH/);
+    assert.match(res.per_symbol['ASX:RHC'].error, /A1M/);
+    assert.match(res.per_symbol['ASX:A1M'].error, /STALE_SERIES_AFTER_SYMBOL_SWITCH/);
+    assert.match(res.per_symbol['ASX:A1M'].error, /DPM/);
+    const file = JSON.parse(readFileSync(res.path, 'utf8'));
+    assert.deepEqual(Object.keys(file.symbols).sort(), ['ASX:DPM']);
+  });
+
+  it('(I) blank/loading chart (no active series) falls back to an unseeded first symbol', async () => {
+    // activeChart stays null → the pre-call read throws → the first symbol acquires
+    // with no seed, exactly like the historical behaviour (no false stale).
+    activeChart = null;
+    const res = await runDump({
+      symbols: ['ASX:RHC'],
+      filename: 'd_first_blank',
+      readinessPolls: 2,
+      readinessIntervalMs: 0,
+    });
+    assert.equal(res.symbols_succeeded, 1);
+    assert.equal(res.symbols_failed, 0);
+    // No gate engaged: exactly one read for RHC (the pre-call read used no symbol).
+    assert.equal(calls.getOhlcv.filter((c) => c.symbol === 'ASX:RHC').length, 1);
   });
 });
