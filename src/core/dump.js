@@ -37,6 +37,13 @@ import { normalizeSymbol } from '../connection.js';
 const DEFAULT_READINESS_POLLS = 8;
 const DEFAULT_READINESS_INTERVAL_MS = 150;
 
+// Minimum number of COMPLETED (non-final) bars required for the binding
+// fingerprint (see bindingFingerprint) to be a trustworthy cross-symbol
+// identifier. Below this we cannot safely distinguish two instruments by their
+// completed history alone and fall back to the full series rather than silently
+// accept an ambiguous match.
+const MIN_COMPLETED_BARS = 2;
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // src/core/dump.js → repo root is two directories up from src/core.
 const REPO_ROOT = dirname(dirname(__dirname));
@@ -83,6 +90,42 @@ export function fingerprintBars(bars) {
 }
 
 /**
+ * Binding/contamination identity for the cross-symbol readiness guard.
+ *
+ * The guard must answer one question: "do these bars still belong to the
+ * PREVIOUS symbol's resident buffer?" The FINAL bar is the worst possible basis
+ * for that: during an open session it is the live FORMING bar whose
+ * close/high/low/volume tick continuously, evolving INDEPENDENTLY of which
+ * instrument is bound. A full-series fingerprint therefore changes merely
+ * because the forming bar ticked — which falsely "proves" a new binding even
+ * though the resident buffer is still the previous symbol's (the live DPM→A1M
+ * contamination: A1M returned DPM's completed history with a slightly different
+ * forming-bar volume, so the full fingerprint differed and stale data was
+ * accepted).
+ *
+ * So we fingerprint every bar EXCEPT the final one. Hundreds of COMPLETED
+ * historical bars are a far stronger, stable binding identifier, and an evolving
+ * final/forming bar can no longer mask that two different symbols share the same
+ * completed history. This is GENERIC: it never inspects dates, session hours, or
+ * holidays — it simply excludes the most-mutable last bar.
+ *
+ * When the series is too short to have MIN_COMPLETED_BARS completed bars we fall
+ * back to the full-series fingerprint — the strongest signal available for such
+ * a short series. The cross-symbol guard still runs on it, so a genuinely
+ * identical short series still polls / fails closed rather than being silently
+ * relabeled.
+ *
+ * NOTE: this is ONLY the internal readiness/contamination guard. It is NOT the
+ * dump-file checksum — the output file's SHA-256 always covers the exact
+ * complete bytes, including the final live/forming bar.
+ */
+export function bindingFingerprint(bars) {
+  const completed = bars.slice(0, -1);
+  if (completed.length >= MIN_COMPLETED_BARS) return fingerprintBars(completed);
+  return fingerprintBars(bars);
+}
+
+/**
  * Read the active pane's series via the shared getOhlcv primitive and PROVE the
  * returned bars belong to the new binding — not the previous symbol's resident
  * buffer.
@@ -93,14 +136,23 @@ export function fingerprintBars(bars) {
  * the NEW label over the PREVIOUS symbol's bars — the exact live ANN←CLX
  * corruption. This adds a bounded POSITIVE data-readiness gate: when the
  * requested symbol differs from the previous SUCCESSFUL symbol yet the returned
- * series is byte-identical to it (fingerprint match), the buffer has not yet
- * refreshed. We then poll the SAME getOhlcv path until the series demonstrably
- * diverges (data now belongs to the new binding) and return that, or FAIL CLOSED
- * with an explicit STALE_SERIES_AFTER_SYMBOL_SWITCH error if it never diverges.
- * Bounded (no infinite retries) and exits early the instant data changes (not a
- * fixed multi-second sleep).
+ * series' COMPLETED HISTORY is byte-identical to it (binding-fingerprint match),
+ * the buffer has not yet refreshed. We then poll the SAME getOhlcv path until the
+ * completed history demonstrably diverges (data now belongs to the new binding)
+ * and return that, or FAIL CLOSED with an explicit STALE_SERIES_AFTER_SYMBOL_SWITCH
+ * error if it never diverges. Bounded (no infinite retries) and exits early the
+ * instant the completed history changes (not a fixed multi-second sleep).
  *
- * Returns { bars, fingerprint }. Throws on empty data or persistent staleness.
+ * CRITICAL: the comparison uses bindingFingerprint (completed history, final bar
+ * excluded) — NOT the full series. During an open session the previous symbol's
+ * forming bar ticks between reads, so a full-series fingerprint would differ even
+ * while the resident buffer is still stale, defeating the guard (the live DPM→A1M
+ * contamination). A mutating final/forming bar must never be accepted as proof of
+ * a new binding.
+ *
+ * Returns { bars, fingerprint }, where `fingerprint` is the BINDING fingerprint
+ * (completed history) used as the reference for the next symbol's guard. Throws
+ * on empty data or persistent staleness.
  */
 async function readFreshBars({ symbol, count, prevSymbol, prevFingerprint, maxPolls, intervalMs }) {
   const read = async () => {
@@ -112,30 +164,31 @@ async function readFreshBars({ symbol, count, prevSymbol, prevFingerprint, maxPo
   };
 
   let bars = await read();
-  let fp = fingerprintBars(bars);
+  let fp = bindingFingerprint(bars);
 
   const crossSymbol =
     prevSymbol != null && normalizeSymbol(symbol) !== normalizeSymbol(prevSymbol);
 
-  // Only a cross-symbol byte-identical series is suspicious. Identical data for
+  // Only a cross-symbol COMPLETED-history match is suspicious. Identical data for
   // the SAME requested instrument (e.g. re-read, or two feed prefixes of one
-  // ticker) is legitimate and never flagged.
+  // ticker) is legitimate and never flagged. A differing current/forming bar does
+  // NOT clear the suspicion — only a divergent completed history does.
   if (crossSymbol && prevFingerprint != null && fp === prevFingerprint) {
     for (let poll = 0; poll < maxPolls; poll++) {
       await new Promise((r) => setTimeout(r, intervalMs));
       const next = await read();
-      const nextFp = fingerprintBars(next);
+      const nextFp = bindingFingerprint(next);
       if (nextFp !== prevFingerprint) {
-        return { bars: next, fingerprint: nextFp }; // diverged → new binding proven
+        return { bars: next, fingerprint: nextFp }; // completed history diverged → new binding proven
       }
       bars = next;
       fp = nextFp;
     }
     throw new Error(
-      `STALE_SERIES_AFTER_SYMBOL_SWITCH: ${symbol} returned a series byte-identical to the previous `
-        + `symbol ${JSON.stringify(prevSymbol)} through ${maxPolls} readiness polls — the resident bar `
-        + `buffer never refreshed to the new binding. Refusing to write ${JSON.stringify(prevSymbol)}'s `
-        + `bars under ${symbol}.`
+      `STALE_SERIES_AFTER_SYMBOL_SWITCH: ${symbol} returned a COMPLETED-history series byte-identical to `
+        + `the previous symbol ${JSON.stringify(prevSymbol)} through ${maxPolls} readiness polls — the `
+        + `resident bar buffer never refreshed to the new binding (a mutating final/forming bar does not `
+        + `prove a new binding). Refusing to write ${JSON.stringify(prevSymbol)}'s bars under ${symbol}.`
     );
   }
 
@@ -177,9 +230,11 @@ export async function dumpOhlcv({
   const failures = {};  // file: { symbol: "error message" }
   const perSymbol = {}; // response metadata for EVERY requested symbol
 
-  // Identity of the last SUCCESSFULLY acquired series — the reference the
-  // post-switch contamination guard compares each NEW symbol against. Updated
-  // only on success, so a failed symbol never poisons the reference.
+  // Binding identity of the last SUCCESSFULLY acquired series — the reference the
+  // post-switch contamination guard compares each NEW symbol against. This is the
+  // COMPLETED-history (bindingFingerprint) value, never the full series, so an
+  // evolving forming bar cannot mask stale data. Updated only on success, so a
+  // failed symbol never poisons the reference.
   let prevSymbol = null;
   let prevFingerprint = null;
 

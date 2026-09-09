@@ -77,14 +77,26 @@ mock.module('../src/core/data.js', {
       const stale = staleReads[symbol];
       if (stale && stale.remaining > 0) {
         stale.remaining -= 1;
-        return { success: true, symbol, bar_count: 5, bars: makeBars(stale.asSymbol) };
+        const staleBars = makeBars(stale.asSymbol);
+        // Reproduce the live DPM→A1M failure: the resident buffer still holds the
+        // previous symbol's COMPLETED history, but the final (forming) bar ticks
+        // on every read during an open session. This makes the FULL-series
+        // fingerprint differ between reads while the completed history stays the
+        // previous symbol's — the exact condition that defeated a full-series guard.
+        if (stale.evolveFinalBar) {
+          stale.tick = (stale.tick || 0) + 1;
+          const last = { ...staleBars[staleBars.length - 1] };
+          last.volume += stale.tick; // forming-bar volume evolves; completed history unchanged
+          staleBars[staleBars.length - 1] = last;
+        }
+        return { success: true, symbol, bar_count: staleBars.length, bars: staleBars };
       }
       return { success: true, symbol, bar_count: 5, bars: makeBars(symbol) };
     },
   },
 });
 
-const { dumpOhlcv, resolveDumpPath, DUMP_DIR, fingerprintBars } = await import('../src/core/dump.js');
+const { dumpOhlcv, resolveDumpPath, DUMP_DIR, fingerprintBars, bindingFingerprint } = await import('../src/core/dump.js');
 
 const created = new Set();
 async function runDump(opts) {
@@ -424,5 +436,122 @@ describe('dumpOhlcv — symbol-data binding race (readiness + contamination guar
     assert.equal(calls.setSymbol.filter((s) => s === 'ASX:ANN').length, 2);
     // Each attempt: 1 initial read + 2 bounded readiness polls = 3; two attempts = 6.
     assert.equal(calls.getOhlcv.filter((c) => c.symbol === 'ASX:ANN').length, 6);
+  });
+});
+
+// ── Forming-bar evolution regression (reproduces the live DPM→A1M contamination) ─
+//
+// LIVE FAILURE (2026-09-08, ASX open): full acquisition DPM→A1M. A1M was written
+// with DPM's bars. A1M's COMPLETED history was byte-identical to DPM's, but DPM's
+// current 2026-09-08 FORMING bar volume ticked between reads (13,936 → 13,956), so
+// the FULL-series fingerprint differed and the old guard accepted the stale series.
+// The binding guard must compare COMPLETED history (final/forming bar excluded) so
+// a mutating forming bar can never prove a new binding.
+describe('dumpOhlcv — forming-bar evolution (DPM→A1M contamination regression)', () => {
+  it('(A) stale completed history + EVOLVING forming volume → not accepted; polls to genuine A1M', async () => {
+    // A1M's buffer holds DPM's completed history for the first two reads, each with
+    // a DIFFERENT forming-bar volume (full fingerprint differs every read), then the
+    // genuine A1M series arrives. A full-series guard would have accepted read #1.
+    staleReads = { 'ASX:A1M': { asSymbol: 'ASX:DPM', remaining: 2, evolveFinalBar: true } };
+    const res = await runDump({
+      symbols: ['ASX:DPM', 'ASX:A1M'],
+      filename: 'd_forming_recover',
+      readinessPolls: 4,
+      readinessIntervalMs: 0,
+    });
+
+    assert.equal(res.symbols_succeeded, 2);
+    assert.equal(res.symbols_failed, 0);
+
+    const file = JSON.parse(readFileSync(res.path, 'utf8'));
+    // A1M must hold the REAL A1M series, never DPM's (at any price scale).
+    assert.equal(fingerprintBars(file.symbols['ASX:A1M'].bars), fingerprintBars(makeBars('ASX:A1M')));
+    assert.notEqual(
+      bindingFingerprint(file.symbols['ASX:A1M'].bars),
+      bindingFingerprint(file.symbols['ASX:DPM'].bars),
+      'A1M completed history must differ from DPM',
+    );
+    // Proof the evolving forming bar did NOT short-circuit the guard: A1M was read
+    // three times (initial stale + 1 stale poll + 1 genuine) before acceptance.
+    assert.equal(calls.getOhlcv.filter((c) => c.symbol === 'ASX:A1M').length, 3);
+    assert.equal(calls.setSymbol.filter((s) => s === 'ASX:A1M').length, 1, 'no rebind needed');
+  });
+
+  it('(B) persistent stale completed history + evolving forming bar → FAIL CLOSED (A1M never written)', async () => {
+    staleReads = { 'ASX:A1M': { asSymbol: 'ASX:DPM', remaining: Infinity, evolveFinalBar: true } };
+    const res = await runDump({
+      symbols: ['ASX:DPM', 'ASX:A1M'],
+      filename: 'd_forming_failclosed',
+      readinessPolls: 2,
+      readinessIntervalMs: 0,
+    });
+
+    assert.equal(res.symbols_succeeded, 1); // only DPM
+    assert.equal(res.symbols_failed, 1);
+    assert.match(res.per_symbol['ASX:A1M'].error, /STALE_SERIES_AFTER_SYMBOL_SWITCH/);
+    assert.match(res.per_symbol['ASX:A1M'].error, /DPM/);
+    assert.equal(res.per_symbol['ASX:A1M'].bars, 0);
+
+    const file = JSON.parse(readFileSync(res.path, 'utf8'));
+    assert.equal(file.symbols['ASX:A1M'], undefined, "DPM's bars must never be written under A1M");
+    assert.ok(file.failures['ASX:A1M']);
+    // Bounded: one initial switch + one rebind retry for A1M.
+    assert.equal(calls.setSymbol.filter((s) => s === 'ASX:A1M').length, 2);
+  });
+
+  it('(C) once completed history becomes the genuine symbol, it is accepted', async () => {
+    // remaining:1 → one stale read (evolving forming bar), then the real A1M.
+    staleReads = { 'ASX:A1M': { asSymbol: 'ASX:DPM', remaining: 1, evolveFinalBar: true } };
+    const res = await runDump({
+      symbols: ['ASX:DPM', 'ASX:A1M'],
+      filename: 'd_forming_accept',
+      readinessPolls: 4,
+      readinessIntervalMs: 0,
+    });
+    assert.equal(res.symbols_succeeded, 2);
+    const file = JSON.parse(readFileSync(res.path, 'utf8'));
+    assert.equal(fingerprintBars(file.symbols['ASX:A1M'].bars), fingerprintBars(makeBars('ASX:A1M')));
+  });
+
+  it('(E) SAME normalized instrument with an evolving forming bar is allowed (no false stale)', async () => {
+    // ASX:DPM then ASX_DLY:DPM (feed-prefix alias). Even with an evolving forming
+    // bar the cross-symbol guard must not engage for the same instrument.
+    staleReads = { 'ASX_DLY:DPM': { asSymbol: 'ASX:DPM', remaining: Infinity, evolveFinalBar: true } };
+    const res = await runDump({
+      symbols: ['ASX:DPM', 'ASX_DLY:DPM'],
+      filename: 'd_forming_alias',
+      readinessPolls: 2,
+      readinessIntervalMs: 0,
+    });
+    assert.equal(res.symbols_succeeded, 2);
+    assert.equal(res.symbols_failed, 0);
+    // Alias never triggers the guard → single read for the second symbol.
+    assert.equal(calls.getOhlcv.filter((c) => c.symbol === 'ASX_DLY:DPM').length, 1);
+  });
+
+  it('(F) raw output still includes the final forming bar (never dropped)', async () => {
+    const res = await runDump({ symbols: ['ASX:DPM', 'ASX:A1M'], filename: 'd_forming_rawtail' });
+    const file = JSON.parse(readFileSync(res.path, 'utf8'));
+    const bars = file.symbols['ASX:A1M'].bars;
+    // makeBars produces 5 bars; the binding fingerprint uses only the first 4, but
+    // the stored file must retain all 5 including the final (forming) bar.
+    assert.equal(bars.length, 5);
+    assert.equal(res.per_symbol['ASX:A1M'].last_time, bars[4].time);
+    assert.notEqual(fingerprintBars(bars), bindingFingerprint(bars), 'final bar is part of the file but excluded from the binding fp');
+  });
+
+  it('(I) a forming-contaminated symbol failing closed does not abort a following valid symbol', async () => {
+    staleReads = { 'ASX:A1M': { asSymbol: 'ASX:DPM', remaining: Infinity, evolveFinalBar: true } };
+    const res = await runDump({
+      symbols: ['ASX:DPM', 'ASX:A1M', 'ASX:WAF'],
+      filename: 'd_forming_continue',
+      readinessPolls: 2,
+      readinessIntervalMs: 0,
+    });
+    assert.equal(res.per_symbol['ASX:A1M'].error !== null, true);
+    assert.equal(res.per_symbol['ASX:WAF'].error, null);
+    assert.equal(res.symbols_succeeded, 2); // DPM + WAF
+    const file = JSON.parse(readFileSync(res.path, 'utf8'));
+    assert.deepEqual(Object.keys(file.symbols).sort(), ['ASX:DPM', 'ASX:WAF']);
   });
 });
