@@ -206,6 +206,63 @@ async function acquireSymbol({ symbol, count, timeoutMs, prevSymbol, prevFingerp
   return readFreshBars({ symbol, count, prevSymbol, prevFingerprint, maxPolls, intervalMs });
 }
 
+/**
+ * Capture the PRE-CALL active-chart binding to seed the contamination guard for
+ * the FIRST requested symbol. Every symbol switch needs a previous binding
+ * reference — including symbols[0]. When this call begins the chart is already
+ * parked on some instrument; that resident series is the implicit "previous
+ * successful" binding for the first requested symbol. Without it symbols[0] is
+ * unguarded and can silently inherit the pre-existing buffer (the live 2026-09-09
+ * A1M→RHC contamination). We read it through the SAME getOhlcv primitive — no
+ * `symbol` arg means "whatever is active", which never relabels data.
+ *
+ * A trustworthy baseline is symbol-present + at least MIN_COMPLETED_BARS bars (a
+ * mid-load single/empty buffer is not trustworthy). If the active series is only
+ * TEMPORARILY unavailable (chart still loading) we do a SMALL BOUNDED readiness
+ * retry on the SAME cadence as the per-symbol readiness gate, exiting the INSTANT
+ * a usable series appears — never an arbitrary long sleep. If a trustworthy
+ * baseline still cannot be obtained we FAIL CLOSED with PRECALL_BINDING_UNAVAILABLE
+ * so the caller aborts BEFORE switching/acquiring/writing any requested symbol:
+ * without a safe reference the first symbol cannot be verified, and accepting it
+ * unguarded would recreate the A1M→RHC integrity hole. This is an acquisition-safety
+ * failure, not a per-ticker analytical failure.
+ *
+ * Returns { symbol, fingerprint } (fingerprint = COMPLETED-history bindingFingerprint).
+ */
+async function captureActiveBinding({ count, maxPolls, intervalMs }) {
+  const tryRead = async () => {
+    let r;
+    try {
+      r = await getOhlcv({ count });
+    } catch {
+      return null; // series/data not ready yet — treated as "not available yet"
+    }
+    if (r && r.symbol && Array.isArray(r.bars) && r.bars.length >= MIN_COMPLETED_BARS) {
+      return { symbol: r.symbol, fingerprint: bindingFingerprint(r.bars) };
+    }
+    return null; // symbol/bars insufficient to be a trustworthy baseline
+  };
+
+  // Initial read + bounded readiness polling (exit the instant a usable series
+  // appears; never loops beyond maxPolls).
+  let baseline = await tryRead();
+  for (let poll = 0; baseline == null && poll < maxPolls; poll++) {
+    await new Promise((r) => setTimeout(r, intervalMs));
+    baseline = await tryRead();
+  }
+  if (baseline == null) {
+    throw new Error(
+      `PRECALL_BINDING_UNAVAILABLE: could not read a trustworthy active chart series `
+        + `(a bound symbol with >= ${MIN_COMPLETED_BARS} bars) through an initial read + ${maxPolls} readiness `
+        + `polls, so there is no safe reference to verify the first requested symbol against. Refusing to acquire `
+        + `an UNGUARDED symbols[0] — that would recreate the A1M→RHC integrity hole where the first symbol `
+        + `silently inherits the pre-existing chart buffer. Failing the whole dump before switching or writing `
+        + `any symbol. Ensure TradingView is loaded with an active chart and retry.`
+    );
+  }
+  return baseline;
+}
+
 export async function dumpOhlcv({
   symbols,
   timeframe = 'D',
@@ -237,35 +294,21 @@ export async function dumpOhlcv({
   // failed symbol never poisons the reference.
   //
   // SEED IT WITH THE PRE-CALL ACTIVE BINDING so the FIRST requested symbol is
-  // guarded exactly like every in-call transition. Every symbol switch needs a
-  // previous binding reference — including symbols[0]. When this call begins the
-  // chart is already parked on some instrument; that resident series IS the implicit
-  // "previous successful" binding for the first requested symbol. Without this seed
-  // symbols[0] is unguarded and can silently inherit the pre-existing buffer (the
-  // live 2026-09-09 A1M→RHC contamination: the chart was on A1M, the call opened
-  // with RHC, and RHC was written with A1M's completed history). We read the active
-  // series through the SAME getOhlcv primitive — no `symbol` arg means "whatever is
-  // active", which never relabels data — AFTER setTimeframe, so the baseline is on
-  // the same resolution as the per-symbol reads, then fingerprint its COMPLETED
-  // history (final/forming bar excluded, same as every other binding fp).
-  //
-  // If the chart has no usable series/bars (blank/still loading), we leave the seed
-  // null and fall back to an unguarded first-symbol acquisition rather than
-  // fabricating a fresh-binding assumption — the in-call guard still protects
-  // symbols[1..N].
-  let prevSymbol = null;
-  let prevFingerprint = null;
-  try {
-    const preCall = await getOhlcv({ count });
-    if (preCall && Array.isArray(preCall.bars) && preCall.bars.length > 0 && preCall.symbol) {
-      prevSymbol = preCall.symbol;
-      prevFingerprint = bindingFingerprint(preCall.bars);
-    }
-  } catch {
-    // No usable active series — safe fall-back to an unseeded first symbol.
-    prevSymbol = null;
-    prevFingerprint = null;
-  }
+  // guarded exactly like every in-call transition (see captureActiveBinding). The
+  // capture runs AFTER setTimeframe so the baseline is on the same resolution as the
+  // per-symbol reads. If a trustworthy baseline cannot be established — even after
+  // bounded readiness polling — captureActiveBinding THROWS PRECALL_BINDING_UNAVAILABLE
+  // and this whole dump fails closed BEFORE any requested symbol is switched,
+  // acquired or written. We never fall back to an unguarded symbols[0]: without a
+  // safe reference the first symbol cannot be verified and would recreate the
+  // A1M→RHC integrity hole.
+  const baseline = await captureActiveBinding({
+    count,
+    maxPolls: readinessPolls,
+    intervalMs: readinessIntervalMs,
+  });
+  let prevSymbol = baseline.symbol;
+  let prevFingerprint = baseline.fingerprint;
 
   // 2. Sequential acquisition. One symbol failing never aborts the rest.
   for (const symbol of symbols) {

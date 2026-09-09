@@ -26,6 +26,7 @@ const attempts = {};        // symbol -> times getOhlcv has been invoked
 let plan = {};              // symbol -> 'ok' | 'fail' | 'fail-then-ok' | 'fail-pane'
 let staleReads = {};        // symbol -> { asSymbol, remaining }  (simulates stale buffer)
 let activeChart = null;     // symbol the chart is PARKED on before the call (pre-call binding)
+let preCallUnavailable = 0; // number of INITIAL no-symbol reads to treat as "not ready yet"
 
 // Bare-ticker normalization mirroring src/connection.js normalizeSymbol, so
 // that "ASX:RHC" and "ASX_DLY:RHC" resolve to the SAME instrument and therefore
@@ -69,10 +70,14 @@ mock.module('../src/core/data.js', {
       calls.getOhlcv.push({ symbol, count });
       // No `symbol` → "read whatever the chart is currently parked on". This is the
       // pre-call active-binding capture: it returns the resident active series
-      // (activeChart). A blank/still-loading chart (activeChart == null) throws
-      // exactly like the real getOhlcv, so the tool falls back to an unseeded first
-      // symbol — never a fabricated fresh binding.
+      // (activeChart). `preCallUnavailable` simulates a chart that is still loading
+      // for the first N reads (throws like the real getOhlcv on an unready series);
+      // a persistently blank chart (activeChart == null) always throws.
       if (symbol == null) {
+        if (preCallUnavailable > 0) {
+          preCallUnavailable -= 1;
+          throw new Error('Could not extract OHLCV data. The chart may still be loading.');
+        }
         if (activeChart == null) throw new Error('Could not extract OHLCV data. The chart may still be loading.');
         return { success: true, symbol: activeChart, bar_count: 5, bars: makeBars(activeChart) };
       }
@@ -122,7 +127,13 @@ beforeEach(() => {
   for (const k of Object.keys(attempts)) delete attempts[k];
   plan = {};
   staleReads = {};
-  activeChart = null;
+  // Default: the chart is parked on a distinct instrument before every call, so the
+  // pre-call binding baseline is trustworthy and the guard can protect symbols[0].
+  // Tests exercising an unavailable baseline override this (activeChart=null and/or
+  // preCallUnavailable). 'ASX:SEED' is a distinct ticker that never collides with a
+  // requested symbol's deterministic bars.
+  activeChart = 'ASX:SEED';
+  preCallUnavailable = 0;
 });
 
 after(() => {
@@ -695,19 +706,67 @@ describe('dumpOhlcv — first symbol vs pre-call active binding (A1M→RHC regre
     assert.deepEqual(Object.keys(file.symbols).sort(), ['ASX:DPM']);
   });
 
-  it('(I) blank/loading chart (no active series) falls back to an unseeded first symbol', async () => {
-    // activeChart stays null → the pre-call read throws → the first symbol acquires
-    // with no seed, exactly like the historical behaviour (no false stale).
-    activeChart = null;
+  it('(I-A) pre-call series temporarily unavailable then appears within bounded polling → proceeds', async () => {
+    // The active chart is loading: the first two pre-call reads are unavailable, then
+    // the genuine baseline appears. Acquisition must proceed normally.
+    activeChart = 'ASX_DLY:A1M';
+    preCallUnavailable = 2;
     const res = await runDump({
       symbols: ['ASX:RHC'],
-      filename: 'd_first_blank',
-      readinessPolls: 2,
+      filename: 'd_precall_recover',
+      readinessPolls: 4,
       readinessIntervalMs: 0,
     });
     assert.equal(res.symbols_succeeded, 1);
     assert.equal(res.symbols_failed, 0);
-    // No gate engaged: exactly one read for RHC (the pre-call read used no symbol).
-    assert.equal(calls.getOhlcv.filter((c) => c.symbol === 'ASX:RHC').length, 1);
+    // Exactly initial read + 2 readiness polls = 3 no-symbol pre-call reads.
+    assert.equal(calls.getOhlcv.filter((c) => c.symbol == null).length, 3);
+    // The first symbol was still guarded against the (recovered) A1M baseline.
+    const file = JSON.parse(readFileSync(res.path, 'utf8'));
+    assert.equal(fingerprintBars(file.symbols['ASX:RHC'].bars), fingerprintBars(makeBars('ASX:RHC')));
+  });
+
+  it('(I-B) pre-call series persistently unavailable → whole dump FAILS CLOSED, nothing switched or written', async () => {
+    activeChart = null; // chart never yields a usable series
+    const filename = 'd_precall_failclosed';
+    await assert.rejects(
+      () => dumpOhlcv({
+        symbols: ['ASX:RHC', 'ASX:L1G'],
+        filename,
+        readinessPolls: 2,
+        readinessIntervalMs: 0,
+      }),
+      /PRECALL_BINDING_UNAVAILABLE/,
+    );
+    // No requested symbol was switched or acquired.
+    assert.equal(calls.setSymbol.length, 0, 'no symbol may be switched without a baseline');
+    assert.equal(calls.getOhlcv.filter((c) => c.symbol != null).length, 0, 'no per-symbol acquisition read');
+    // No output file (not even a leftover temp) was written.
+    const p = resolveDumpPath(filename);
+    assert.ok(!existsSync(p), 'no dump file may be written when the baseline fails');
+    assert.ok(!existsSync(`${p}.tmp`));
+  });
+
+  it('(I-C) bounded pre-call polling does not loop indefinitely (initial read + exactly maxPolls)', async () => {
+    activeChart = null;
+    await assert.rejects(
+      () => dumpOhlcv({
+        symbols: ['ASX:RHC'],
+        filename: 'd_precall_bounded',
+        readinessPolls: 3,
+        readinessIntervalMs: 0,
+      }),
+      /PRECALL_BINDING_UNAVAILABLE/,
+    );
+    // 1 initial read + exactly 3 readiness polls = 4 no-symbol reads, then it stops.
+    assert.equal(calls.getOhlcv.filter((c) => c.symbol == null).length, 4);
+  });
+
+  it('(I-F) a healthy pre-call baseline adds no delay beyond the single initial read', async () => {
+    // Default activeChart is available immediately → exactly ONE no-symbol pre-call
+    // read, no readiness polling (even though readinessIntervalMs defaults to 150ms).
+    const res = await runDump({ symbols: ['ASX:RHC'], filename: 'd_precall_fast' });
+    assert.equal(res.symbols_succeeded, 1);
+    assert.equal(calls.getOhlcv.filter((c) => c.symbol == null).length, 1, 'healthy baseline = one read, no polling');
   });
 });
