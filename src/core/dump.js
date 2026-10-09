@@ -158,7 +158,7 @@ export function bindingFingerprint(bars) {
  */
 async function readFreshBars({ symbol, count, prevSymbol, prevFingerprint, maxPolls, intervalMs }) {
   const read = async () => {
-    const r = await getOhlcv({ symbol, count });
+    const r = await getOhlcv({ symbol, count, verify: false }); // session + identity checked by the caller
     if (!r || !Array.isArray(r.bars) || r.bars.length === 0) {
       throw new Error(`No bars returned for ${symbol}`);
     }
@@ -256,7 +256,7 @@ async function captureActiveBinding({ count, maxPolls, intervalMs }) {
   const tryRead = async () => {
     let r;
     try {
-      r = await getOhlcv({ count });
+      r = await getOhlcv({ count, verify: false }); // baseline read only; never written
     } catch {
       return null; // series/data not ready yet — treated as "not available yet"
     }

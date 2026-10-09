@@ -27,6 +27,7 @@ export function createFakeCdp({ initialSymbol = 'ASX:TNE', initialBasePrice = 32
     pendingSwitch: null, // { symbol, basePrice, settleAfterReads, reads }
     focusedIndex: 0,
     totalPanes: 2,
+    sessionDisconnected: false,
   };
 
   const evaluateLog = [];
@@ -46,6 +47,11 @@ export function createFakeCdp({ initialSymbol = 'ASX:TNE', initialBasePrice = 32
     evaluateLog.push(expression);
 
     if (expression === '1') return { result: { value: 1 } };
+
+    // session.js sessionState() — the "Session disconnected" modal check
+    if (/session disconnected/i.test(expression)) {
+      return { result: { value: state.sessionDisconnected ? 'DISCONNECTED' : 'OK' } };
+    }
 
     if (expression.includes('_mainDiv.click()')) {
       const m = expression.match(/all\[(\d+)\]/);

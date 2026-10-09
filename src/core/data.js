@@ -2,6 +2,8 @@
  * Core data access logic.
  */
 import { evaluate, evaluateAsync, KNOWN_PATHS, assertActiveSymbolMatches } from '../connection.js';
+import { assertSessionConnected } from './session.js';
+import { verifyIdentity } from './identity.js';
 
 const MAX_OHLCV_BARS = 500;
 const MAX_TRADES = 20;
@@ -58,8 +60,16 @@ function buildGraphicsJS(collectionName, mapKey, filter) {
   `;
 }
 
-export async function getOhlcv({ symbol, count, summary } = {}) {
+/**
+ * `verify` (default true) fails closed on a disconnected session and checks the
+ * captured last close against an independent reference. Only dumpOhlcv passes
+ * `verify: false` for its internal polling reads — it runs both checks itself.
+ */
+export async function getOhlcv({ symbol, count, summary, verify = true } = {}) {
   const limit = Math.min(count || 100, MAX_OHLCV_BARS);
+  // A disconnected session freezes the bar buffer while symbol switches still
+  // relabel the chart (RMS label over COH bars, 2026-10-09).
+  if (verify) await assertSessionConnected();
   let data;
   try {
     data = await evaluate(`
@@ -97,6 +107,37 @@ export async function getOhlcv({ symbol, count, summary } = {}) {
     ready: true,
   });
 
+  // The label match above uses the chart's own state, which a frozen chart can make
+  // agree with itself. Prove the bars belong to the instrument against a reference
+  // that does not come from the chart. With no requested symbol, the bars must still
+  // belong to whatever the chart claims to show — the label alone is never proof.
+  let identity = null;
+  if (verify) {
+    const claimed = symbol || data.active_symbol;
+    const lastClose = data.bars[data.bars.length - 1].close;
+    if (!claimed) {
+      throw new Error('IDENTITY_UNVERIFIED: the active chart reports no symbol, so these bars cannot be '
+        + 'attributed to any instrument. Refusing to return them.');
+    }
+    identity = await verifyIdentity(claimed, lastClose);
+    if (identity.status === 'MISMATCH') {
+      throw new Error(
+        `IDENTITY_MISMATCH: ${claimed} captured last close ${identity.captured_close} but the independent `
+          + `reference for ${identity.symbol} is ${identity.reference_close} (ratio ${identity.ratio}) — these bars `
+          + `belong to another instrument. Refusing to return them under ${claimed}.`
+      );
+    }
+    if (identity.status === 'UNAVAILABLE') {
+      throw new Error(
+        `IDENTITY_UNVERIFIED: independent price reference for ${identity.symbol} unavailable (${identity.reason}); `
+          + `cannot prove these bars belong to ${claimed}. Refusing to return them.`
+      );
+    }
+  }
+  const identityFields = identity
+    ? { identity: identity.status, identity_reference_close: identity.reference_close ?? null }
+    : {};
+
   if (summary) {
     const bars = data.bars;
     const highs = bars.map(b => b.high);
@@ -114,10 +155,11 @@ export async function getOhlcv({ symbol, count, summary } = {}) {
       change_pct: Math.round(((last.close - first.open) / first.open) * 10000) / 100 + '%',
       avg_volume: Math.round(volumes.reduce((a, b) => a + b, 0) / volumes.length),
       last_5_bars: bars.slice(-5),
+      ...identityFields,
     };
   }
 
-  return { success: true, symbol: data.active_symbol, bar_count: data.bars.length, total_available: data.total_bars, source: data.source, bars: data.bars };
+  return { success: true, symbol: data.active_symbol, bar_count: data.bars.length, total_available: data.total_bars, source: data.source, ...identityFields, bars: data.bars };
 }
 
 export async function getIndicator({ entity_id }) {

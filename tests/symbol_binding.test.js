@@ -20,10 +20,26 @@ import { createFakeCdp } from './helpers/fake_cdp.js';
 
 const fake = createFakeCdp({ initialSymbol: 'ASX:TNE', initialBasePrice: 32 });
 
-mock.method(globalThis, 'fetch', async () => ({
-  ok: true,
-  json: async () => [{ type: 'page', url: 'https://www.tradingview.com/chart/abc', id: 'MOCK_TARGET' }],
-}));
+// Independent scanner reference closes (what scanner.tradingview.com reports for the
+// GENUINE instrument). Fake bars close at basePrice + 0.02.
+const scannerRefs = { TNE: 32.02, RMS: 4.02, COH: 128.02 };
+let scannerDown = false;
+const scannerCalls = [];
+
+mock.method(globalThis, 'fetch', async (url) => {
+  if (String(url).includes('scanner.tradingview.com')) {
+    const sym = decodeURIComponent(String(url).match(/symbol=([^&]+)/)[1]);
+    scannerCalls.push(sym);
+    if (scannerDown) throw new Error('ECONNREFUSED');
+    const t = sym.split(':')[1];
+    if (!(t in scannerRefs)) return { ok: false, status: 404, json: async () => ({ code: 'symbol_not_exists' }) };
+    return { ok: true, status: 200, json: async () => ({ close: scannerRefs[t], description: t }) };
+  }
+  return {
+    ok: true,
+    json: async () => [{ type: 'page', url: 'https://www.tradingview.com/chart/abc', id: 'MOCK_TARGET' }],
+  };
+});
 
 mock.module('chrome-remote-interface', {
   exports: { default: async () => fake.client },
@@ -31,6 +47,19 @@ mock.module('chrome-remote-interface', {
 
 const { setSymbol, focus } = await import('../src/core/pane.js');
 const { getQuote, getOhlcv } = await import('../src/core/data.js');
+
+// Bind the fake chart directly: `label` is what series.symbol() reports, `basePrice`
+// sets whose bars are resident (bars close at basePrice + 0.02).
+function setChart(label, basePrice) {
+  resetState(label, basePrice);
+  fake.state.nextSettle = null;
+  fake.state.pendingSwitch = null;
+  fake.state.activeSymbol = label;
+  fake.state.bars = Array.from({ length: 20 }, (_, i) => ({
+    time: 1700000000 + i * 3600, open: basePrice, high: basePrice + 0.1, low: basePrice - 0.1,
+    close: basePrice + 0.02, volume: 1000 + i,
+  }));
+}
 
 function resetState(symbol = 'ASX:TNE', basePrice = 32) {
   fake.state.activeSymbol = symbol;
@@ -159,12 +188,86 @@ describe('getOhlcv() — identity guard', () => {
     assert.ok(result.close > 3 && result.close < 5, `expected an RMS-magnitude close, got ${result.close}`);
   });
 
-  it('does not verify identity when no symbol was requested (backward compatible: "whatever is active")', async () => {
-    resetState('ASX:TNE', 32);
-    fake.state.pendingSwitch = null;
+  it('with no symbol requested, still verifies the bars against the active label\'s independent reference', async () => {
+    setChart('ASX:TNE', 32);
+    scannerCalls.length = 0;
 
     const result = await getOhlcv({ summary: true });
     assert.equal(result.success, true);
     assert.equal(result.symbol, 'ASX:TNE');
+    assert.equal(result.identity, 'VERIFIED');
+    assert.deepEqual(scannerCalls, ['ASX:TNE']);
+  });
+});
+
+// 2026-10-09 (ED #47): TradingView Desktop showed "Session disconnected", the bar
+// buffer froze on COH (~$128) and a symbol switch relabelled the chart RMS. The label
+// guard above then AGREED with the request, so COH's bars were accepted as RMS.
+describe('getOhlcv() — independent identity + session (RMS←COH, 2026-10-09)', () => {
+  // Chart label says RMS, but the resident bars are COH's.
+  const contaminate = () => setChart('ASX_DLY:RMS', 128);
+
+  it('rejects COH bars under an RMS label even though the label matches the request', async () => {
+    contaminate();
+    await assert.rejects(
+      () => getOhlcv({ symbol: 'ASX_DLY:RMS', summary: true }),
+      /IDENTITY_MISMATCH.*ASX:RMS.*4\.02/s
+    );
+  });
+
+  it('rejects the same contamination when no symbol is passed (no label-only bypass)', async () => {
+    contaminate();
+    await assert.rejects(() => getOhlcv({ count: 50 }), /IDENTITY_MISMATCH/);
+  });
+
+  it('fails closed with IDENTITY_UNVERIFIED when the independent reference is unavailable', async () => {
+    setChart('ASX:RMS', 4);
+    scannerDown = true;
+    try {
+      await assert.rejects(() => getOhlcv({ symbol: 'ASX_DLY:RMS' }), /IDENTITY_UNVERIFIED.*ECONNREFUSED/s);
+    } finally {
+      scannerDown = false;
+    }
+  });
+
+  it('returns VERIFIED identity and the reference close on genuine bars', async () => {
+    setChart('ASX:RMS', 4);
+    const result = await getOhlcv({ symbol: 'ASX_DLY:RMS' });
+    assert.equal(result.identity, 'VERIFIED');
+    assert.equal(result.identity_reference_close, 4.02);
+    assert.ok(result.bars.length > 0);
+  });
+
+  it('passes an index the scanner does not know as NO_REFERENCE (label guard still applies)', async () => {
+    setChart('ASX:XJO', 8700);
+    const result = await getOhlcv({ symbol: 'ASX_DLY:XJO', summary: true });
+    assert.equal(result.identity, 'NO_REFERENCE');
+  });
+
+  it('fails closed on a disconnected session BEFORE reading any bars', async () => {
+    setChart('ASX:RMS', 4);
+    fake.state.sessionDisconnected = true;
+    fake.evaluateLog.length = 0;
+    try {
+      await assert.rejects(() => getOhlcv({ symbol: 'ASX_DLY:RMS' }), /TV_SESSION_DISCONNECTED/);
+      await assert.rejects(() => getOhlcv({ summary: true }), /TV_SESSION_DISCONNECTED/);
+      assert.equal(fake.evaluateLog.filter((e) => e.includes('active_symbol: activeSymbol')).length, 0);
+    } finally {
+      fake.state.sessionDisconnected = false;
+    }
+  });
+
+  it('verify:false (dumpOhlcv internal polling only) skips both checks', async () => {
+    contaminate();
+    fake.state.sessionDisconnected = true;
+    scannerCalls.length = 0;
+    try {
+      const result = await getOhlcv({ symbol: 'ASX_DLY:RMS', verify: false, summary: true });
+      assert.equal(result.success, true);
+      assert.equal(result.identity, undefined);
+      assert.equal(scannerCalls.length, 0);
+    } finally {
+      fake.state.sessionDisconnected = false;
+    }
   });
 });
