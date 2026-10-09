@@ -27,6 +27,12 @@ let plan = {};              // symbol -> 'ok' | 'fail' | 'fail-then-ok' | 'fail-
 let staleReads = {};        // symbol -> { asSymbol, remaining }  (simulates stale buffer)
 let activeChart = null;     // symbol the chart is PARKED on before the call (pre-call binding)
 let preCallUnavailable = 0; // number of INITIAL no-symbol reads to treat as "not ready yet"
+let activeBarsAs = null;    // pre-call buffer holds THIS instrument's bars under activeChart's label
+let frozenAs = null;        // frozen/disconnected feed: EVERY read returns this instrument's bars
+let sessionDisconnected = false; // TradingView "Session disconnected" modal is showing
+const sessionChecks = { n: 0 };
+let identityMode = {};      // ticker -> 'unavailable' | 'no_reference'  (default: reference = genuine bars)
+const identityCalls = [];
 
 // Bare-ticker normalization mirroring src/connection.js normalizeSymbol, so
 // that "ASX:RHC" and "ASX_DLY:RHC" resolve to the SAME instrument and therefore
@@ -50,6 +56,36 @@ function makeBars(symbol, n = 5) {
   }));
 }
 
+mock.module('../src/core/session.js', {
+  exports: {
+    SESSION_DISCONNECTED: 'TV_SESSION_DISCONNECTED',
+    sessionState: async () => (sessionDisconnected ? 'DISCONNECTED' : 'OK'),
+    assertSessionConnected: async () => {
+      sessionChecks.n += 1;
+      if (sessionDisconnected) throw new Error('TV_SESSION_DISCONNECTED: test');
+    },
+  },
+});
+mock.module('../src/core/identity.js', {
+  exports: {
+    IDENTITY_TOLERANCE: 0.15,
+    scannerSymbol: (s) => `ASX:${ticker(s)}`,
+    independentClose: async () => ({ status: 'OK' }),
+    // Reference = the GENUINE instrument's last close (what the independent scanner
+    // would report). Captured bars from another instrument therefore mismatch.
+    verifyIdentity: async (symbol, lastClose) => {
+      identityCalls.push({ symbol, lastClose });
+      const mode = identityMode[ticker(symbol)];
+      if (mode === 'unavailable') return { status: 'UNAVAILABLE', symbol: `ASX:${ticker(symbol)}`, reason: 'timeout', captured_close: lastClose };
+      if (mode === 'no_reference') return { status: 'NO_REFERENCE', symbol: `ASX:${ticker(symbol)}`, captured_close: lastClose };
+      const genuine = makeBars(symbol);
+      const ref = genuine[genuine.length - 1].close;
+      const ratio = lastClose / ref;
+      return { status: Math.abs(ratio - 1) <= 0.15 ? 'VERIFIED' : 'MISMATCH', symbol: `ASX:${ticker(symbol)}`,
+        reference_close: ref, captured_close: lastClose, ratio };
+    },
+  },
+});
 mock.module('../src/core/chart.js', {
   exports: {
     setTimeframe: async ({ timeframe }) => { calls.setTimeframe.push(timeframe); return { success: true, timeframe }; },
@@ -79,7 +115,12 @@ mock.module('../src/core/data.js', {
           throw new Error('Could not extract OHLCV data. The chart may still be loading.');
         }
         if (activeChart == null) throw new Error('Could not extract OHLCV data. The chart may still be loading.');
-        return { success: true, symbol: activeChart, bar_count: 5, bars: makeBars(activeChart) };
+        const resident = frozenAs || activeBarsAs || activeChart;
+        return { success: true, symbol: activeChart, bar_count: 5, bars: makeBars(resident) };
+      }
+      if (frozenAs) {
+        // Frozen feed: the label follows the request, the bars never change.
+        return { success: true, symbol, bar_count: 5, bars: makeBars(frozenAs) };
       }
       attempts[symbol] = (attempts[symbol] || 0) + 1;
       const p = plan[symbol] || 'ok';
@@ -134,6 +175,12 @@ beforeEach(() => {
   // requested symbol's deterministic bars.
   activeChart = 'ASX:SEED';
   preCallUnavailable = 0;
+  activeBarsAs = null;
+  frozenAs = null;
+  sessionDisconnected = false;
+  sessionChecks.n = 0;
+  identityMode = {};
+  identityCalls.length = 0;
 });
 
 after(() => {
@@ -768,5 +815,77 @@ describe('dumpOhlcv — first symbol vs pre-call active binding (A1M→RHC regre
     const res = await runDump({ symbols: ['ASX:RHC'], filename: 'd_precall_fast' });
     assert.equal(res.symbols_succeeded, 1);
     assert.equal(calls.getOhlcv.filter((c) => c.symbol == null).length, 1, 'healthy baseline = one read, no polling');
+  });
+});
+
+
+describe('dumpOhlcv — independent identity (RMS←COH, 2026-10-09)', () => {
+  it('(J) label RMS over COH bars (no switch detectable) → IDENTITY_MISMATCH, FAILS CLOSED, never written', async () => {
+    activeChart = 'ASX_DLY:RMS';                                   // label already RMS…
+    activeBarsAs = 'ASX_DLY:COH';                                  // …over COH's buffer
+    staleReads = { 'ASX_DLY:RMS': { asSymbol: 'ASX_DLY:COH', remaining: 99 } };
+    const res = await runDump({ symbols: ['ASX_DLY:RMS'], filename: 'd_rms_label', readinessPolls: 2, readinessIntervalMs: 0 });
+    assert.equal(res.symbols_succeeded, 0);
+    assert.match(res.per_symbol['ASX_DLY:RMS'].error, /IDENTITY_MISMATCH/);
+    assert.deepEqual(JSON.parse(readFileSync(res.path, 'utf8')).symbols, {});
+  });
+
+  it('(K) the RETRY CALL after a stale switch (label RMS, frozen COH feed) also FAILS CLOSED', async () => {
+    activeChart = 'ASX_DLY:RMS';
+    frozenAs = 'ASX_DLY:COH';
+    const res = await runDump({ symbols: ['ASX_DLY:RMS'], filename: 'd_rms_retry', readinessPolls: 2, readinessIntervalMs: 0 });
+    assert.equal(res.symbols_succeeded, 0);
+    assert.match(res.per_symbol['ASX_DLY:RMS'].error, /IDENTITY_MISMATCH/);
+    assert.deepEqual(JSON.parse(readFileSync(res.path, 'utf8')).symbols, {});
+  });
+
+  it('(L) a later read that becomes genuine within the one retry is accepted and VERIFIED', async () => {
+    activeChart = 'ASX_DLY:RMS';
+    activeBarsAs = 'ASX_DLY:COH';
+    staleReads = { 'ASX_DLY:RMS': { asSymbol: 'ASX_DLY:COH', remaining: 1 } };   // first attempt stale only
+    const res = await runDump({ symbols: ['ASX_DLY:RMS'], filename: 'd_rms_recovers', readinessPolls: 2, readinessIntervalMs: 0 });
+    assert.equal(res.symbols_succeeded, 1);
+    assert.equal(res.per_symbol['ASX_DLY:RMS'].identity, 'VERIFIED');
+    assert.deepEqual(JSON.parse(readFileSync(res.path, 'utf8')).symbols['ASX_DLY:RMS'].bars, makeBars('ASX_DLY:RMS'));
+  });
+
+  it('(M) unavailable independent reference → IDENTITY_UNVERIFIED, fails closed', async () => {
+    identityMode = { RMS: 'unavailable' };
+    const res = await runDump({ symbols: ['ASX:RMS', 'ASX:CBA'], filename: 'd_unverified', readinessPolls: 2, readinessIntervalMs: 0 });
+    assert.match(res.per_symbol['ASX:RMS'].error, /IDENTITY_UNVERIFIED/);
+    assert.equal(res.per_symbol['ASX:CBA'].identity, 'VERIFIED');            // others unaffected
+    assert.deepEqual(Object.keys(JSON.parse(readFileSync(res.path, 'utf8')).symbols), ['ASX:CBA']);
+  });
+
+  it('(N) no independent reference (index) → keeps fingerprint guards, reported as NO_REFERENCE', async () => {
+    identityMode = { XJO: 'no_reference' };
+    const res = await runDump({ symbols: ['ASX:XJO'], filename: 'd_index', readinessPolls: 2, readinessIntervalMs: 0 });
+    assert.equal(res.symbols_succeeded, 1);
+    assert.equal(res.per_symbol['ASX:XJO'].identity, 'NO_REFERENCE');
+  });
+
+  it('(Q) every successful symbol is identity-checked against its own last close', async () => {
+    const res = await runDump({ symbols: ['ASX:RMS', 'ASX:CBA'], filename: 'd_checked', readinessPolls: 2, readinessIntervalMs: 0 });
+    assert.equal(res.symbols_succeeded, 2);
+    assert.deepEqual(identityCalls.map((c) => c.symbol), ['ASX:RMS', 'ASX:CBA']);
+  });
+});
+
+describe('dumpOhlcv — disconnected TradingView session', () => {
+  it('(O) a disconnected session fails the whole dump BEFORE any switch, read or write', async () => {
+    sessionDisconnected = true;
+    await assert.rejects(
+      runDump({ symbols: ['ASX:RMS'], filename: 'd_disconnected', readinessPolls: 2, readinessIntervalMs: 0 }),
+      /TV_SESSION_DISCONNECTED/,
+    );
+    assert.equal(calls.setSymbol.length, 0);
+    assert.equal(calls.getOhlcv.length, 0);
+    assert.equal(existsSync(resolveDumpPath('d_disconnected')), false);
+  });
+
+  it('(P) session is checked before acquisition and again before writing', async () => {
+    const res = await runDump({ symbols: ['ASX:RMS'], filename: 'd_session_twice', readinessPolls: 2, readinessIntervalMs: 0 });
+    assert.equal(res.symbols_succeeded, 1);
+    assert.equal(sessionChecks.n, 2);
   });
 });

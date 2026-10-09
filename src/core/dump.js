@@ -27,6 +27,8 @@ import { getOhlcv } from './data.js';
 import { setSymbol as paneSetSymbol } from './pane.js';
 import { setTimeframe } from './chart.js';
 import { normalizeSymbol } from '../connection.js';
+import { assertSessionConnected } from './session.js';
+import { verifyIdentity } from './identity.js';
 
 // Bounded post-switch data-readiness gate defaults. After a symbol switch the
 // resident bar buffer can briefly still hold the PREVIOUS symbol's data even
@@ -156,7 +158,7 @@ export function bindingFingerprint(bars) {
  */
 async function readFreshBars({ symbol, count, prevSymbol, prevFingerprint, maxPolls, intervalMs }) {
   const read = async () => {
-    const r = await getOhlcv({ symbol, count });
+    const r = await getOhlcv({ symbol, count, verify: false }); // session + identity checked by the caller
     if (!r || !Array.isArray(r.bars) || r.bars.length === 0) {
       throw new Error(`No bars returned for ${symbol}`);
     }
@@ -203,7 +205,28 @@ async function readFreshBars({ symbol, count, prevSymbol, prevFingerprint, maxPo
  */
 async function acquireSymbol({ symbol, count, timeoutMs, prevSymbol, prevFingerprint, maxPolls, intervalMs }) {
   await paneSetSymbol({ index: 0, symbol, timeoutMs });
-  return readFreshBars({ symbol, count, prevSymbol, prevFingerprint, maxPolls, intervalMs });
+  const got = await readFreshBars({ symbol, count, prevSymbol, prevFingerprint, maxPolls, intervalMs });
+  // Independent identity: the label/fingerprint guards above use the chart's own
+  // state, which a frozen or half-switched chart can make agree with itself (RMS
+  // label over COH bars, 2026-10-09). Compare the captured close with a reference
+  // that does not come from the chart. A mismatch or an unavailable reference is a
+  // failed attempt (retried once by the caller, then failed closed).
+  const last = got.bars[got.bars.length - 1];
+  const identity = await verifyIdentity(symbol, last.close);
+  if (identity.status === 'MISMATCH') {
+    throw new Error(
+      `IDENTITY_MISMATCH: ${symbol} captured last close ${identity.captured_close} but the independent `
+        + `reference for ${identity.symbol} is ${identity.reference_close} (ratio ${identity.ratio}) — these bars `
+        + `belong to another instrument. Refusing to write them under ${symbol}.`
+    );
+  }
+  if (identity.status === 'UNAVAILABLE') {
+    throw new Error(
+      `IDENTITY_UNVERIFIED: independent price reference for ${identity.symbol} unavailable (${identity.reason}); `
+        + `cannot prove these bars belong to ${symbol}. Refusing to write them.`
+    );
+  }
+  return { ...got, identity };
 }
 
 /**
@@ -233,7 +256,7 @@ async function captureActiveBinding({ count, maxPolls, intervalMs }) {
   const tryRead = async () => {
     let r;
     try {
-      r = await getOhlcv({ count });
+      r = await getOhlcv({ count, verify: false }); // baseline read only; never written
     } catch {
       return null; // series/data not ready yet — treated as "not available yet"
     }
@@ -278,6 +301,10 @@ export async function dumpOhlcv({
   // Validate the destination BEFORE doing any slow acquisition work.
   const finalPath = resolveDumpPath(filename);
   const started = Date.now();
+
+  // 0. A disconnected TradingView session freezes the data feed while symbol switches
+  //    still relabel the chart — nothing read in that state can be trusted.
+  await assertSessionConnected();
 
   // 1. Set the requested timeframe ONCE. Resolution persists across the
   //    per-symbol setSymbol() calls below, so this need not repeat.
@@ -344,6 +371,8 @@ export async function dumpOhlcv({
         first_time: first.time,
         last_time: last.time,
         last_close: last.close,
+        identity: acquired.identity ? acquired.identity.status : null,
+        identity_reference_close: acquired.identity ? acquired.identity.reference_close ?? null : null,
         error: null,
       };
       prevSymbol = symbol;
@@ -354,6 +383,9 @@ export async function dumpOhlcv({
       perSymbol[symbol] = { bars: 0, first_time: null, last_time: null, last_close: null, error: msg };
     }
   }
+
+  // A session that dropped DURING acquisition taints everything read in this call.
+  await assertSessionConnected();
 
   // 3. Build the generic raw file object (native getOhlcv bar fields intact).
   const fileObj = {
