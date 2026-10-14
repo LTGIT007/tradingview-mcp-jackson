@@ -1,7 +1,7 @@
 /**
  * Core health/discovery/launch logic.
  */
-import { getClient, getTargetInfo, evaluate, getPinnedTarget, getAccessState } from '../connection.js';
+import { getClient, getTargetInfo, evaluate, getPinnedTarget, getAccessState, requireVerifiedTab } from '../connection.js';
 import { existsSync } from 'fs';
 import { execSync, spawn } from 'child_process';
 
@@ -164,6 +164,10 @@ export async function uiState() {
 }
 
 export async function launch({ port, kill_existing } = {}) {
+  if (requireVerifiedTab()) {
+    // Automation mode: never kill/relaunch the shared TradingView app.
+    throw new Error('tv_launch is disabled when TV_REQUIRE_VERIFIED_TAB=1');
+  }
   const cdpPort = port || 9222;
   const killFirst = kill_existing !== false;
   const platform = process.platform;

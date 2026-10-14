@@ -234,6 +234,12 @@ describe('TV_REQUIRE_VERIFIED_TAB=1 (automation mode)', () => {
     assert.deepEqual(panes.panes.map(p => p.resolution), ['240', '60']);
   });
 
+  it('refuses tv_launch (never kills/relaunches the shared app in automation mode)', async () => {
+    process.env.TV_REQUIRE_VERIFIED_TAB = '1';
+    const { launch } = await import('../src/core/health.js');
+    await assert.rejects(launch({}), /tv_launch is disabled when TV_REQUIRE_VERIFIED_TAB=1/);
+  });
+
   it('tab_switch pins but does not verify: access stays refused', async () => {
     process.env.TV_REQUIRE_VERIFIED_TAB = '1';
     await tab.switchTab({ index: 1 });
