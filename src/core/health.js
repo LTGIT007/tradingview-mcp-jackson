@@ -1,7 +1,7 @@
 /**
  * Core health/discovery/launch logic.
  */
-import { getClient, getTargetInfo, evaluate } from '../connection.js';
+import { getClient, getTargetInfo, evaluate, getPinnedTarget } from '../connection.js';
 import { existsSync } from 'fs';
 import { execSync, spawn } from 'child_process';
 
@@ -33,8 +33,11 @@ export async function healthCheck() {
     success: true,
     cdp_connected: true,
     target_id: target.id,
-    target_url: target.url,
-    target_title: target.title,
+    // LIVE page url/title (read now through the connection); the cached /json/list
+    // values can describe a layout that was since replaced in the same tab.
+    target_url: state?.url || target.url,
+    target_title: state?.title || target.title,
+    pinned_target_id: getPinnedTarget()?.id || null,
     chart_symbol: state?.symbol || 'unknown',
     chart_resolution: state?.resolution || 'unknown',
     chart_type: state?.chartType ?? null,

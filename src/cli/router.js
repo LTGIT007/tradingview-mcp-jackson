@@ -132,7 +132,8 @@ async function execute(handler, values, positionals) {
   try {
     const result = await handler(values, positionals);
     console.log(JSON.stringify(result, null, 2));
-    process.exit(0);
+    // A handler may set process.exitCode to flag a non-success result (e.g. tab select).
+    process.exit(typeof process.exitCode === 'number' ? process.exitCode : 0);
   } catch (err) {
     handleError(err);
   }

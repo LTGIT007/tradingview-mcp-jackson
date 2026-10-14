@@ -2,6 +2,10 @@ import CDP from 'chrome-remote-interface';
 
 let client = null;
 let targetInfo = null;
+// Pinned tab: once a caller selects a tab (tab_select / tab_switch), every
+// (re)connection attaches to THAT CDP target id and never falls back to the first
+// chart page in /json/list. Without a pin the original first-chart behaviour applies.
+let pinned = null; // { id, chartId }
 const CDP_HOST = 'localhost';
 const CDP_PORT = 9222;
 const MAX_RETRIES = 5;
@@ -43,6 +47,18 @@ export async function getClient() {
   return connect();
 }
 
+export function pinTarget(id, chartId = null) {
+  pinned = id ? { id, chartId } : null;
+}
+
+export function unpinTarget() {
+  pinned = null;
+}
+
+export function getPinnedTarget() {
+  return pinned ? { ...pinned } : null;
+}
+
 export async function connect() {
   let lastError;
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
@@ -62,16 +78,27 @@ export async function connect() {
       return client;
     } catch (err) {
       lastError = err;
+      if (err.pinnedTargetGone) break; // fail fast: never retry onto another tab
       const delay = Math.min(BASE_DELAY * Math.pow(2, attempt), 30000);
       await new Promise(r => setTimeout(r, delay));
     }
   }
+  if (lastError?.pinnedTargetGone) throw lastError;
   throw new Error(`CDP connection failed after ${MAX_RETRIES} attempts: ${lastError?.message}`);
 }
 
 async function findChartTarget() {
   const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
   const targets = await resp.json();
+  if (pinned) {
+    const t = targets.find(x => x.id === pinned.id);
+    if (!t) {
+      const err = new Error(`Pinned TradingView tab ${pinned.id} is no longer open; select a tab again (tab_select).`);
+      err.pinnedTargetGone = true;
+      throw err;
+    }
+    return t;
+  }
   // Prefer targets with tradingview.com/chart in the URL
   return targets.find(t => t.type === 'page' && /tradingview\.com\/chart/i.test(t.url))
     || targets.find(t => t.type === 'page' && /tradingview/i.test(t.url))
