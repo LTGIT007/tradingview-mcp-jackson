@@ -1,7 +1,7 @@
 /**
  * Core health/discovery/launch logic.
  */
-import { getClient, getTargetInfo, evaluate, getPinnedTarget } from '../connection.js';
+import { getClient, getTargetInfo, evaluate, getPinnedTarget, getAccessState } from '../connection.js';
 import { existsSync } from 'fs';
 import { execSync, spawn } from 'child_process';
 
@@ -38,6 +38,7 @@ export async function healthCheck() {
     target_url: state?.url || target.url,
     target_title: state?.title || target.title,
     pinned_target_id: getPinnedTarget()?.id || null,
+    tab_access: getAccessState(),
     chart_symbol: state?.symbol || 'unknown',
     chart_resolution: state?.resolution || 'unknown',
     chart_type: state?.chartType ?? null,
