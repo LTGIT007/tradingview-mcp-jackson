@@ -17,17 +17,19 @@ Rules:
 
 ## Deploy
 
-Run in the live checkout:
+Run in the live checkout, in a shell that stops on the first error (`set -e`):
 
 ```sh
+set -e
 # 1. Preconditions: clean tree, on the operational branch
 git status --porcelain              # must print nothing
 git branch --show-current           # must be the operational branch
 
-# 2. Record a rollback point (local tag, never pushed)
+# 2. Record a rollback point (lightweight local tag: needs no git identity; never pushed)
 PREV=$(git rev-parse HEAD)
 TAG="deployed/$(date -u +%Y%m%dT%H%M%SZ)-prev"
-git tag -a "$TAG" -m "rollback point before deploy" "$PREV"
+git tag "$TAG" "$PREV"
+test "$(git rev-parse "$TAG^{commit}")" = "$PREV"   # do not continue without a rollback point
 
 # 3. Fast-forward only. A non-fast-forward means the branch was rewritten: stop.
 git fetch <remote>
@@ -50,7 +52,7 @@ Then start a new client session (or reconnect the MCP server) and call
 Run in the live checkout:
 
 ```sh
-git tag -l 'deployed/*' --sort=-creatordate | head   # newest rollback point first
+git tag -l 'deployed/*' --sort=-refname | head      # newest rollback point first (UTC in name)
 git status --porcelain                               # must print nothing
 git switch --detach <rollback-tag>                   # non-destructive; branch untouched
 node src/cli/index.js tab list                       # read-only smoke
