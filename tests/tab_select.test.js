@@ -264,6 +264,15 @@ describe('preflight (single process)', () => {
     assert.deepEqual(r.pane_resolutions, ['60', '60']);
   });
 
+  it('PANES_MISMATCH blocks chart access until a later preflight is READY', async () => {
+    browser.live.T_REVIEW.resolutions = ['1D', '1D'];
+    assert.equal((await tab.preflight({ chart_id: 'BBBB2222', resolutions: '240,60' })).status, 'PANES_MISMATCH');
+    await assert.rejects(pane.list(), /PANES_MISMATCH/);
+    browser.live.T_REVIEW.resolutions = ['240', '60'];
+    assert.equal((await tab.preflight({ chart_id: 'BBBB2222', resolutions: '240,60' })).status, 'READY');
+    assert.equal((await pane.list()).panes.length, 2);
+  });
+
   it('PANES_MISMATCH on order and count', async () => {
     browser.live.T_REVIEW.resolutions = ['60', '240'];
     assert.equal((await tab.preflight({ chart_id: 'BBBB2222', resolutions: '240,60' })).status, 'PANES_MISMATCH');

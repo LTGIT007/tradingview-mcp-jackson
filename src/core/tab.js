@@ -229,7 +229,7 @@ export async function selectTab({ chart_id, title_contains, layout_id } = {}) {
  *   READY           identity verified, panes match `resolutions` (in pane order),
  *                   and the live url still carries chart_id after the pane read
  *   MISSING / AMBIGUOUS / MISMATCH   as selectTab
- *   PANES_MISMATCH  verified tab, wrong pane count or resolutions
+ *   PANES_MISMATCH  verified tab, wrong pane count or resolutions (blocks chart access)
  *   ERROR           connection/evaluation failure
  */
 export async function preflight({ chart_id, title_contains, layout_id, resolutions } = {}) {
@@ -251,6 +251,9 @@ export async function preflight({ chart_id, title_contains, layout_id, resolutio
     const stillOk = chartIdFromUrl(after?.url) === sel.chart_id;
     if (!stillOk) blockChartAccess('MISMATCH: live identity changed during preflight');
     const status = !stillOk ? 'MISMATCH' : panesOk ? 'READY' : 'PANES_MISMATCH';
+    // Fail closed: a verified tab whose panes do not match is not the evidence surface
+    // the caller asked for, so later reads in this process are refused until a READY.
+    if (status === 'PANES_MISMATCH') blockChartAccess(`PANES_MISMATCH: panes ${JSON.stringify(got)} != ${JSON.stringify(expected)}`);
     return {
       success: status === 'READY',
       ready: status === 'READY',
