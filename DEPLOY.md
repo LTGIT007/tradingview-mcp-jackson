@@ -79,7 +79,8 @@ tv tab preflight --chart-id <id> --resolutions 240,60 [--layout-id <n>] [--title
 ```
 
 It selects and verifies the tab, reads its panes and re-checks the live identity
-through one pinned connection. Exit code 0 only for `status: "READY"`; otherwise 3
+through one pinned connection. Every non-READY result, including `PANES_MISMATCH`,
+blocks chart access in that process until a later selection verifies. Exit code 0 only for `status: "READY"`; otherwise 3
 (`MISSING`, `AMBIGUOUS`, `MISMATCH`, `PANES_MISMATCH`, `ERROR`). The MCP tool
 `tab_preflight` does the same inside a server process.
 
