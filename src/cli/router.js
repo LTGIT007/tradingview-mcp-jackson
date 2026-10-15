@@ -3,6 +3,7 @@
  * Zero dependencies — uses only Node.js built-ins.
  */
 import { parseArgs } from 'node:util';
+import { disconnect } from '../connection.js';
 
 /** @type {Map<string, { description: string, options?: object, handler: Function, subcommands?: Map<string, object> }>} */
 const commands = new Map();
@@ -128,23 +129,31 @@ export async function run(argv) {
   }
 }
 
+// Exit by draining the event loop, not process.exit(): exiting while the CDP
+// WebSocket / fetch sockets are still closing aborts Node on Windows (libuv
+// UV_HANDLE_CLOSING assertion, exit 0xC0000409), replacing the command's real exit
+// code with a crash code. An unref'd timer forces exit only if a handle lingers.
+async function exitCleanly(code) {
+  process.exitCode = code;
+  try { await disconnect(); } catch {}
+  setTimeout(() => process.exit(code), 3000).unref();
+}
+
 async function execute(handler, values, positionals) {
+  let result;
   try {
-    const result = await handler(values, positionals);
-    console.log(JSON.stringify(result, null, 2));
-    process.exit(0);
+    result = await handler(values, positionals);
   } catch (err) {
-    handleError(err);
+    return handleError(err);
   }
+  console.log(JSON.stringify(result, null, 2));
+  // A handler may set process.exitCode to flag a non-success result (e.g. tab select).
+  return exitCleanly(typeof process.exitCode === 'number' ? process.exitCode : 0);
 }
 
 function handleError(err) {
   const message = err.message || String(err);
-  // Connection failures get exit code 2
-  if (/CDP|connection|ECONNREFUSED|not running/i.test(message)) {
-    console.error(JSON.stringify({ success: false, error: message }, null, 2));
-    process.exit(2);
-  }
   console.error(JSON.stringify({ success: false, error: message }, null, 2));
-  process.exit(1);
+  // Connection failures get exit code 2
+  return exitCleanly(/CDP|connection|ECONNREFUSED|not running/i.test(message) ? 2 : 1);
 }

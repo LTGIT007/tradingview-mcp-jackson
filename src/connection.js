@@ -2,10 +2,28 @@ import CDP from 'chrome-remote-interface';
 
 let client = null;
 let targetInfo = null;
-const CDP_HOST = 'localhost';
-const CDP_PORT = 9222;
+// Tab pinning and verification (process-local, by design: every new process,
+// e.g. each CLI invocation or MCP server start, begins unpinned and unverified).
+//
+// pinned:   once a tab is selected (tab_select / tab_switch), every (re)connection
+//           attaches to THAT CDP target id and never falls back to another tab.
+// verified: tab_select proved the pinned page's LIVE url carries chartId. Every
+//           liveness check and reconnect re-reads the live url; a change revokes it.
+// blocked:  set when a selection failed (MISSING/AMBIGUOUS/MISMATCH/error), the
+//           pinned tab closed, or its live identity changed. While set, every
+//           getClient() (so every chart read/write) fails until a new tab_select
+//           verifies. Unpinned, never-selected processes behave as before unless
+//           TV_REQUIRE_VERIFIED_TAB=1, which refuses all chart access until a
+//           tab_select has VERIFIED in this process.
+let pinned = null; // { id, chartId, verified }
+let blocked = null; // reason string
+const CDP_HOST = process.env.TV_CDP_HOST || 'localhost';
+const CDP_PORT = Number(process.env.TV_CDP_PORT || 9222);
 const MAX_RETRIES = 5;
 const BASE_DELAY = 500;
+
+export { CDP_HOST, CDP_PORT };
+export const LOCATION_EXPR = 'window.location.href';
 
 // Known direct API paths discovered via live probing (see PROBE_RESULTS.md)
 const KNOWN_PATHS = {
@@ -29,18 +47,84 @@ const KNOWN_PATHS = {
 
 export { KNOWN_PATHS };
 
+export function requireVerifiedTab() {
+  return process.env.TV_REQUIRE_VERIFIED_TAB === '1';
+}
+
+export function chartIdFromUrl(url) {
+  return String(url || '').match(/\/chart\/([^/?#]+)/)?.[1] || null;
+}
+
+/** Chart access gate: every tool reaches the page through this. */
 export async function getClient() {
+  if (blocked) {
+    throw new Error(`TradingView tab not verified (${blocked}); call tab_select to select and verify a tab.`);
+  }
+  if (requireVerifiedTab() && !pinned?.verified) {
+    throw new Error('No verified TradingView tab in this process (TV_REQUIRE_VERIFIED_TAB=1); call tab_select first.');
+  }
+  return getClientUnchecked();
+}
+
+/** Raw connection for tab selection itself; bypasses the gate but still pins. */
+export async function getClientUnchecked() {
   if (client) {
+    let alive = false;
     try {
-      // Quick liveness check
-      await client.Runtime.evaluate({ expression: '1', returnByValue: true });
+      // Liveness check; for a verified pin it is also a live identity check.
+      const r = await client.Runtime.evaluate({ expression: pinned?.verified ? LOCATION_EXPR : '1', returnByValue: true });
+      alive = true;
+      if (pinned?.verified) assertLiveIdentity(r.result?.value);
       return client;
-    } catch {
+    } catch (err) {
+      if (alive) throw err; // identity revoked: do not reconnect around it
       client = null;
       targetInfo = null;
     }
   }
   return connect();
+}
+
+function assertLiveIdentity(liveUrl) {
+  const live = chartIdFromUrl(liveUrl);
+  if (live !== pinned.chartId) {
+    pinned.verified = false;
+    blocked = `IDENTITY_CHANGED: pinned tab now shows ${live || 'no chart'}, expected ${pinned.chartId}`;
+    throw new Error(`TradingView tab not verified (${blocked}); call tab_select to select and verify a tab.`);
+  }
+}
+
+export function pinTarget(id, chartId = null, { verified = false } = {}) {
+  pinned = id ? { id, chartId, verified: !!verified } : null;
+}
+
+export function markVerified() {
+  if (!pinned) throw new Error('markVerified: no pinned tab');
+  pinned.verified = true;
+  blocked = null;
+}
+
+/** Revoke chart access until a new tab_select verifies (fail closed). */
+export function blockChartAccess(reason) {
+  if (pinned) pinned.verified = false;
+  blocked = String(reason || 'UNVERIFIED');
+}
+
+export function clearBlock() {
+  blocked = null;
+}
+
+export function unpinTarget() {
+  pinned = null;
+  blocked = null;
+}
+
+export function getPinnedTarget() {
+  return pinned ? { ...pinned } : null;
+}
+
+export function getAccessState() {
+  return { pinned: getPinnedTarget(), blocked, require_verified_tab: requireVerifiedTab() };
 }
 
 export async function connect() {
@@ -59,12 +143,27 @@ export async function connect() {
       await client.Page.enable();
       await client.DOM.enable();
 
+      if (pinned?.verified) {
+        // A reconnect must land on the SAME live layout, not merely the same tab id.
+        const r = await client.Runtime.evaluate({ expression: LOCATION_EXPR, returnByValue: true });
+        try {
+          assertLiveIdentity(r.result?.value);
+        } catch (err) {
+          err.noRetry = true;
+          throw err;
+        }
+      }
       return client;
     } catch (err) {
       lastError = err;
+      if (err.pinnedTargetGone || err.noRetry) break; // fail fast: never retry onto another tab
       const delay = Math.min(BASE_DELAY * Math.pow(2, attempt), 30000);
       await new Promise(r => setTimeout(r, delay));
     }
+  }
+  if (lastError?.pinnedTargetGone || lastError?.noRetry) {
+    if (client) { try { await client.close(); } catch {} client = null; targetInfo = null; }
+    throw lastError;
   }
   throw new Error(`CDP connection failed after ${MAX_RETRIES} attempts: ${lastError?.message}`);
 }
@@ -72,6 +171,16 @@ export async function connect() {
 async function findChartTarget() {
   const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
   const targets = await resp.json();
+  if (pinned) {
+    const t = targets.find(x => x.id === pinned.id);
+    if (!t) {
+      blockChartAccess(`TAB_CLOSED: pinned tab ${pinned.id} is no longer open`);
+      const err = new Error(`Pinned TradingView tab ${pinned.id} is no longer open; select a tab again (tab_select).`);
+      err.pinnedTargetGone = true;
+      throw err;
+    }
+    return t;
+  }
   // Prefer targets with tradingview.com/chart in the URL
   return targets.find(t => t.type === 'page' && /tradingview\.com\/chart/i.test(t.url))
     || targets.find(t => t.type === 'page' && /tradingview/i.test(t.url))
